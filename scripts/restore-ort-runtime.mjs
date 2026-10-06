@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 const VERSION = '1.24.0-dev.20251116-b39e144322';
 const EXPECTED = {
   'ort-wasm-simd-threaded.asyncify.mjs': '4b90d459fc7b1c57b8744cfc8acda25930016f9cd8f264b33bd12f0c01b18bca',
-  'ort-wasm-simd-threaded.asyncify.wasm': 'e0c0c6d3e73d43b8a249972f8358f845b08cc16fec3c80efafdf8bed40366786'
+  'ort-wasm-simd-threaded.asyncify.wasm': '8a38f6b173b3af049f4b489bedbe1da253ceed7a1720f96cdef603f2836b665c'
 };
 
 const root = resolve(new URL('..', import.meta.url).pathname.replace(/^\/(?:[A-Za-z]:)/, (m) => m.slice(1)));
