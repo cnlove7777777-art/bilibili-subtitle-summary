@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>视频字幕</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <header>
+      <div class="mark">字幕</div>
+      <div><h1>视频字幕</h1><p>提取已有字幕 · 本地生成字幕</p></div>
+    </header>
+
+    <section id="state" class="state">
+      <span id="dot" aria-hidden="true"></span>
+      <div><strong id="stateTitle">正在检查</strong><p id="status">读取当前页面状态…</p></div>
+    </section>
+
+    <section class="actions" aria-label="字幕操作">
+      <label class="destination capture-source"><span>识别来源</span><select id="captureMode"><option value="auto">自动选择播放器</option><option value="tab">当前标签页声音</option></select></label>
+      <button id="live" class="primary" type="button">开始字幕</button>
+      <div class="button-row"><button id="extract" type="button">提取已有字幕</button><button id="export" type="button">导出 SRT</button></div>
+    </section>
+
+    <label class="destination"><span>总结发送到</span><select id="destination"><option value="chatgpt">ChatGPT</option><option value="aistudio">Gemini</option><option value="deepseek">DeepSeek</option></select></label>
+    <button id="feedback" class="settings" type="button">反馈问题</button>
+    <button id="options" class="settings" type="button">打开完整设置</button>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

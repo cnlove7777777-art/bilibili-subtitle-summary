@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>反馈问题</title>
+  <link rel="stylesheet" href="feedback.css">
+</head>
+<body>
+  <main>
+    <h1>反馈问题</h1>
+    <p>哪个平台、哪一步出了问题？欢迎直接说。</p>
+    <form id="form">
+      <label for="message">问题描述</label>
+      <textarea id="message" rows="5" maxlength="3000" placeholder="例如：虎牙直播有声音，开启字幕后一直没有文字。" required></textarea>
+      <label class="check"><input id="includeDiagnostics" type="checkbox" checked>附带版本、平台域名和错误类型</label>
+      <p class="note">不会自动附带音频、字幕正文、完整链接或原始日志。</p>
+      <details open><summary>发送内容预览</summary><pre id="preview"></pre></details>
+      <div class="actions">
+        <button id="send" type="submit" disabled>发送反馈</button>
+        <button id="copy" type="button">复制反馈</button>
+        <button id="save" type="button">保存报告</button>
+      </div>
+      <p id="status" role="status">正在准备…</p>
+      <a href="https://chromewebstore.google.com/detail/dcjhbacpogmjdclmmnhebjjkknknblmm" target="_blank" rel="noopener noreferrer">到商店留言</a>
+    </form>
+  </main>
+  <script src="feedback-shared.js"></script>
+  <script src="feedback.js"></script>
+</body>
+</html>

@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>视频字幕设置</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="top-line" aria-hidden="true"></div>
+  <div class="shell">
+    <aside class="side">
+      <div class="brand">
+        <div class="hero-mark">字幕</div>
+        <div class="brand-copy">
+          <p class="eyebrow">BROWSER ASR</p>
+          <h1>字幕设置</h1>
+        </div>
+      </div>
+
+      <nav class="nav" aria-label="设置分类">
+        <button class="nav-item active" data-section="sec-model" type="button" aria-current="page"><span class="no">01</span>识别</button>
+        <button class="nav-item" data-section="sec-audio" type="button"><span class="no">02</span>音频</button>
+        <button class="nav-item" data-section="sec-summary" type="button"><span class="no">03</span>总结</button>
+        <button class="nav-item" data-section="sec-autocaption" type="button"><span class="no">04</span>自动字幕</button>
+        <button class="nav-item" data-section="sec-translate" type="button"><span class="no">05</span>翻译</button>
+        <button class="nav-item" data-section="sec-debug" type="button"><span class="no">06</span>诊断</button>
+        <button class="nav-item" data-section="sec-logs" type="button"><span class="no">07</span>日志</button>
+      </nav>
+
+      <div class="side-foot">
+        <span class="local-badge">本地推理</span>
+        <p class="side-note">修改后自动保存。模型、后端和线程设置会在空闲时立即生效。</p>
+      </div>
+    </aside>
+
+    <main class="content">
+      <section class="card model-card" id="sec-model">
+        <div class="section-title">
+          <span>01</span>
+          <div><h2>识别</h2><p>选择本地模型和执行后端。</p></div>
+        </div>
+
+        <div class="route-grid">
+          <label>ASR 模型
+            <select id="asrProfile">
+              <option value="sensevoice_browser">SenseVoice Small</option>
+              <option value="qwen3_asr_0_6b">Qwen3-ASR 0.6B</option>
+            </select>
+          </label>
+          <label>执行后端
+            <select id="asrBackend" disabled>
+              <option value="auto">GPU FP16 → CPU INT8</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="model-facts" aria-label="模型权重说明">
+          <span><strong>Qwen</strong> GPU FP16 · 1.89 GB</span>
+          <span><strong>SenseVoice</strong> GPU 469 MB · CPU 240 MB</span>
+        </div>
+
+        <div class="subsection">
+          <h3>输入与性能</h3>
+          <div class="setting-grid">
+            <label>现成字幕语言
+              <select id="language">
+                <option value="auto">自动</option><option value="zh">中文</option><option value="yue">粤语</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option>
+              </select>
+              <span class="hint">仅用于选择网页已有字幕轨。</span>
+            </label>
+            <label>CPU 线程
+              <select id="recognitionThreads">
+                <option value="0">自动</option>
+              </select>
+              <span id="recognitionThreadsHint" class="hint">Qwen 仅使用 GPU；此项不参与推理。</span>
+            </label>
+            <label>长句定稿窗口
+              <div class="input-unit"><input id="liveChunkSeconds" type="number" min="4" max="12" step="0.25" value="11.5"><span>秒</span></div>
+              <span id="liveChunkSecondsHint" class="hint">临时字幕持续修订，到停顿或该上限后定稿。</span>
+            </label>
+            <label>连续扫描速度
+              <select id="scanPlaybackRate">
+                <option value="1">1×</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option><option value="6">6×（实验）</option><option value="8">8×（实验）</option>
+              </select>
+              <span class="hint">无独立音轨时扫描，先恢复正常语速再识别。建议 2–4×；6–8× 受浏览器采集带宽限制，清晰度可能下降。积压时自动暂停/恢复。</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="model-check">
+          <button id="check" class="secondary" type="button">检查环境</button>
+          <pre id="status" role="status">尚未检查</pre>
+        </div>
+      </section>
+
+      <section class="card" id="sec-audio" hidden>
+        <div class="section-title"><span>02</span><div><h2>远场音频控制</h2><p>提高远距离、低电平人声的可辨度。</p></div></div>
+        <div class="audio-control-grid">
+          <label class="toggle-row"><input id="voiceEnhance" type="checkbox"><span><strong>启用音频控制</strong><small>仅处理送入识别模型的音频。</small></span></label>
+          <label>处理强度
+            <select id="voiceEnhancePreset">
+              <option value="gentle">轻度</option>
+              <option value="balanced">平衡（推荐）</option>
+              <option value="strong">强</option>
+            </select>
+            <span class="hint">强度越高，底噪衰减和远场增益越大。</span>
+          </label>
+        </div>
+        <div class="audio-chain" aria-label="音频处理顺序"><span>低切</span><i>→</i><span>软降噪</span><i>→</i><span>自动增益</span><i>→</i><span>限幅</span></div>
+        <p class="section-footnote">浏览器内实时 DSP；不下载增强模型，不改变音频时长。</p>
+      </section>
+
+      <section class="card" id="sec-summary" hidden>
+        <div class="section-title"><span>03</span><div><h2>总结</h2><p>字幕文本会自动发送到选定网页。</p></div></div>
+        <div class="summary-toolbar">
+          <label>默认目标<select id="defaultDestination"><option value="chatgpt">ChatGPT</option><option value="aistudio">Gemini</option><option value="deepseek">DeepSeek</option></select></label>
+        </div>
+        <div class="grid three prompts">
+          <label>ChatGPT<textarea id="prompt" rows="4" aria-label="ChatGPT 总结提示词"></textarea></label>
+          <label>Gemini<textarea id="aiStudioPrompt" rows="4" aria-label="Gemini 总结提示词"></textarea></label>
+          <label>DeepSeek<textarea id="deepseekPrompt" rows="4" aria-label="DeepSeek 总结提示词"></textarea></label>
+        </div>
+        <details><summary>网页地址</summary><div class="grid three"><label>ChatGPT<input id="chatgptUrl" type="url"></label><label>Gemini<input id="aiStudioUrl" type="url"></label><label>DeepSeek<input id="deepseekUrl" type="url"></label></div></details>
+      </section>
+
+      <section class="card" id="sec-autocaption" hidden>
+        <div class="section-title"><span>04</span><div><h2>自动字幕</h2><p>页面没有现成字幕时自动启动本地识别。</p></div></div>
+        <div class="toggle-list">
+          <label class="toggle-row"><input id="autoCaptionsMainstream" type="checkbox"><span><strong>B站与 YouTube</strong><small>仅在没有官方或 CC 字幕时启动。</small></span></label>
+          <label class="toggle-row"><input id="autoCaptionsOther" type="checkbox"><span><strong>其他网站与本地视频</strong><small>检测到视频或播放中的音频后启动；可随时关闭。</small></span></label>
+        </div>
+        <p class="section-footnote">刷新视频页面后生效。</p>
+      </section>
+
+      <section class="card" id="sec-translate" hidden>
+        <div class="section-title"><span>05</span><div><h2>翻译</h2><p>把整轨前瞻字幕的识别文本送模型翻译后再上屏。</p></div></div>
+
+        <label class="toggle-row"><input id="translateEnabled" type="checkbox"><span><strong>启用字幕翻译</strong><small>仅对能直接取到音轨的视频生效：B站音轨、YouTube 音轨，以及其他站点的 M3U8 / MP4。页面自带官方字幕、以及拿不到音轨时的实时取音后备，都不走这里。</small></span></label>
+
+        <div class="translate-grid translate-head">
+          <label>翻译来源
+            <select id="translateMode">
+              <option value="local">本地服务</option>
+              <option value="remote">远程 API</option>
+            </select>
+            <span class="hint">两者都是 OpenAI 兼容接口，只换地址与模型。</span>
+          </label>
+          <label>目标语言
+            <select id="translateTargetLanguage">
+              <option value="zh">中文（简体）</option>
+              <option value="zh-Hant">中文（繁体）</option>
+              <option value="en">英语</option>
+              <option value="ja">日语</option>
+              <option value="ko">韩语</option>
+              <option value="fr">法语</option>
+              <option value="de">德语</option>
+              <option value="es">西班牙语</option>
+              <option value="ru">俄语</option>
+              <option value="pt">葡萄牙语</option>
+            </select>
+            <span class="hint">默认中文（简体）。</span>
+          </label>
+          <label>字幕显示
+            <select id="translateDisplayMode">
+              <option value="translated">仅译文（默认）</option>
+              <option value="bilingual">双语（原文小字）</option>
+            </select>
+            <span class="hint">识别进度会领先播放头，所以默认直接显示译文；双语模式在译文下方加一行更小的原文。</span>
+          </label>
+        </div>
+
+        <div class="translate-panel" id="translateLocalPanel">
+          <h3>本地服务</h3>
+          <div class="translate-grid">
+            <label>Base URL
+              <input id="translateLocalBaseUrl" type="url" spellcheck="false" placeholder="http://127.0.0.1:8888/v1">
+              <span class="hint">默认指向本机 UNSLOTH Studio 的 API 端口。</span>
+            </label>
+            <label>API Key
+              <input id="translateLocalApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="本地服务不需要鉴权时可留空">
+              <span class="hint">UNSLOTH Studio 在「API Keys」里生成，形如 sk-unsloth-…</span>
+            </label>
+            <label class="translate-model-field">模型
+              <div class="input-with-action">
+                <select id="translateLocalModel"><option value="">未选择</option></select>
+                <button id="translateLocalModelList" class="secondary" type="button">获取模型</button>
+              </div>
+              <span id="translateLocalModelHint" class="hint">点「获取模型」从当前 Base URL 拉取；首次冷启动可能要等几十秒。</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="translate-panel" id="translateRemotePanel" hidden>
+          <h3>远程 API</h3>
+          <div class="translate-grid">
+            <label>Base URL
+              <input id="translateRemoteBaseUrl" type="url" spellcheck="false" placeholder="https://api.openai.com/v1">
+              <span class="hint">填到 /v1 为止，程序会自己拼 /models 与 /chat/completions。</span>
+            </label>
+            <label>API Key
+              <input id="translateRemoteApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-…">
+              <span class="hint">仅保存在本机浏览器存储，不会上传。</span>
+            </label>
+            <label class="translate-model-field">模型
+              <div class="input-with-action">
+                <select id="translateRemoteModel"><option value="">未选择</option></select>
+                <button id="translateRemoteModelList" class="secondary" type="button">获取模型</button>
+              </div>
+              <span id="translateRemoteModelHint" class="hint">点「获取模型」从当前 Base URL 拉取。</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="translate-actions">
+          <button id="translateTest" class="secondary" type="button">测试翻译</button>
+          <span class="translate-actions-note">测试会真实发送两句英文，确认整条链路。</span>
+        </div>
+        <pre id="translateStatus" role="status">尚未测试</pre>
+
+        <p class="section-footnote">翻译开启后，识别进度一路领先播放头，只要领先足够就直接显示译文——不会再出现"先原文、再原地覆盖"。被子幕追平（快进/回拖到刚识别的区域）或翻译失败时，立刻改显示识别原文，字幕不会中断，也不会把半成品写进缓存或发去总结。</p>
+      </section>
+
+      <section class="card debug-card" id="sec-debug" hidden>
+        <div class="section-title"><span>06</span><div><h2>诊断</h2><p>检查环境、缓存和模型链路。</p></div></div>
+        <div class="debug-grid">
+          <button id="debugRefresh" class="secondary" type="button">刷新状态</button>
+          <button id="runSelfTest" class="secondary" type="button">能力自检</button>
+          <button id="clearModelCache" class="secondary danger" type="button">清除模型缓存</button>
+        </div>
+        <pre id="debugStatus" role="status">尚未诊断</pre>
+        <div class="benchmark-head">
+          <div><h3>模型下载</h3><p>首次识别会自动检测 GPU 并下载所需模型，也可在这里预下载。SenseVoice GPU FP16 约 469 MB，CPU INT8 约 240 MB。</p></div>
+          <div class="diagnostic-actions">
+            <button id="downloadAllModels" type="button">下载全部</button>
+            <button id="cancelModelDownload" class="secondary" type="button" disabled>全部停止</button>
+          </div>
+        </div>
+        <div id="modelDownloadStatus" class="download-overview" role="status">
+          <div class="download-overview-line"><span>总进度</span><strong data-download-total-percent>0.0%</strong></div>
+          <div class="download-progress" aria-hidden="true"><i data-download-total-bar></i></div>
+          <div class="download-overview-meta" data-download-total-meta>0 B / 2.42 GB · 0/10 文件</div>
+        </div>
+        <div id="modelDownloadList" class="model-download-list">
+          <article class="model-download-item" data-download-route="qwen-webgpu">
+            <header><div><h4>Qwen3-ASR 0.6B</h4><small>GPU · FP16</small></div><button class="secondary model-download-action" type="button">下载</button></header>
+            <div class="model-download-line"><span data-route-status>未开始</span><strong data-route-speed>—</strong></div>
+            <div class="download-progress" aria-hidden="true"><i data-route-bar></i></div>
+            <div class="model-download-meta"><span data-route-progress>0 B</span><span data-route-source>—</span></div>
+            <div class="model-download-error" data-route-error hidden></div>
+          </article>
+          <article class="model-download-item" data-download-route="sense-webgpu">
+            <header><div><h4>SenseVoice Small</h4><small>GPU · FP16</small></div><button class="secondary model-download-action" type="button">下载</button></header>
+            <div class="model-download-line"><span data-route-status>未开始</span><strong data-route-speed>—</strong></div>
+            <div class="download-progress" aria-hidden="true"><i data-route-bar></i></div>
+            <div class="model-download-meta"><span data-route-progress>0 B</span><span data-route-source>—</span></div>
+            <div class="model-download-error" data-route-error hidden></div>
+          </article>
+          <article class="model-download-item" data-download-route="sense-wasm">
+            <header><div><h4>SenseVoice Small</h4><small>CPU · INT8</small></div><button class="secondary model-download-action" type="button">下载</button></header>
+            <div class="model-download-line"><span data-route-status>未开始</span><strong data-route-speed>—</strong></div>
+            <div class="download-progress" aria-hidden="true"><i data-route-bar></i></div>
+            <div class="model-download-meta"><span data-route-progress>0 B</span><span data-route-source>—</span></div>
+            <div class="model-download-error" data-route-error hidden></div>
+          </article>
+        </div>
+        <div class="benchmark-head">
+          <div><h3>链路测速</h3><p>固定模型与后端，不自动回退。</p></div>
+          <button id="cancelBenchmark" class="secondary" type="button" disabled>停止测速</button>
+        </div>
+        <div class="benchmark-grid">
+          <button class="benchmark-button secondary" type="button" data-profile="qwen3_asr_0_6b" data-backend="webgpu">Qwen · GPU FP16<span>首次约 1.89 GB</span></button>
+          <button class="benchmark-button secondary" type="button" data-profile="sensevoice_browser" data-backend="webgpu">SenseVoice · GPU FP16<span>首次约 469 MB</span></button>
+          <button class="benchmark-button secondary" type="button" data-profile="sensevoice_browser" data-backend="wasm">SenseVoice · CPU INT8<span>首次约 240 MB</span></button>
+        </div>
+        <p class="section-footnote benchmark-note">一分钟随包真实语音；测试链路和 RTF，不作为字准率基准。</p>
+        <pre id="benchmarkStatus" role="status">尚未运行模型测速</pre>
+      </section>
+
+      <section class="card" id="sec-logs" hidden>
+        <div class="section-title"><span>07</span><div><h2>日志</h2><p>最近 600 条；浏览器重启后清空。</p></div></div>
+        <div class="debug-grid">
+          <button id="logsRefresh" class="secondary" type="button">刷新</button>
+          <button id="logsCopy" class="secondary" type="button">复制日志</button>
+          <button id="logsFeedback" class="secondary" type="button">反馈问题</button>
+          <button id="logsClear" class="secondary" type="button">清空</button>
+        </div>
+        <pre id="logsOutput">尚未加载</pre>
+      </section>
+    </main>
+  </div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="options.js"></script>
+</body>
+</html>

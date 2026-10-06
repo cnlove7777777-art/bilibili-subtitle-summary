@@ -1,0 +1,20 @@
+# Third-party notices
+
+This proof-of-concept bundles runtime code from these packages:
+
+- `@huggingface/transformers` 4.2.0 — Apache License 2.0
+- `onnxruntime-web` 1.26.0-dev.20260416-b7804b056c — MIT License
+- `mp4box` 2.4.1 — BSD 3-Clause License
+
+The speech model and preprocessing data are downloaded at runtime and are not included in the extension archive:
+
+- `ruska1117/SenseVoiceSmall-onnx-fp16`, converted from `iic/SenseVoiceSmall`
+- `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`
+- Original model project: `FunAudioLLM/SenseVoiceSmall`
+- `goryodog/tokihisu-qwen3-asr-0.6b-webgpu`, converted from `Qwen/Qwen3-ASR-0.6B`
+- Original Qwen3-ASR project: `QwenLM/Qwen3-ASR`
+
+The archive includes the Transformers.js, ONNX Runtime, and MP4Box.js license texts in
+`vendor/`. SenseVoice remains subject to its upstream model license. The Qwen
+conversion and weights retain the upstream Apache-2.0 attribution; review all
+upstream repositories before production distribution.

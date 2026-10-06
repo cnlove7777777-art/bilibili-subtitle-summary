@@ -1,0 +1,158 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "121",
+  "name": "全网视频实时字幕与总结 · 浏览器识别 | Browser Live Captions & Summary",
+  "version": "0.16.24",
+  "description": "浏览器内完成语音转文字与实时字幕，无需单独部署大模型服务；支持 B站、YouTube 与通用视频网站，并可接本地/云端 API 翻译字幕、将字幕送往 AI 总结。",
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting",
+    "activeTab",
+    "tabCapture",
+    "offscreen",
+    "unlimitedStorage",
+    "declarativeNetRequest",
+    "webRequest",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "file:///*",
+    "http://*/*",
+    "https://*/*",
+    "https://www.bilibili.com/*",
+    "https://api.bilibili.com/*",
+    "https://aisubtitle.hdslb.com/*",
+    "https://*.youtube.com/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://aistudio.google.com/*",
+    "https://chat.deepseek.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https: http:"
+  },
+  "cross_origin_embedder_policy": {
+    "value": "require-corp"
+  },
+  "cross_origin_opener_policy": {
+    "value": "same-origin"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "全网视频实时字幕与总结 · 浏览器识别 | Browser Live Captions & Summary",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_page": "options.html",
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "local-file-bridge.html",
+        "local-file-bridge.js",
+        "audio-worklet.js"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ]
+    }
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "media-observer.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "fetch-bridge.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "media-discovery.js",
+        "capture-audio.js",
+        "universal.js"
+      ],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "attachment-guard.js",
+        "chatgpt.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://aistudio.google.com/*"
+      ],
+      "js": [
+        "attachment-guard.js",
+        "aistudio.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "attachment-guard.js",
+        "deepseek.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "toggle-live-captions": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "开始或停止当前标签页的本地字幕"
+    }
+  }
+}

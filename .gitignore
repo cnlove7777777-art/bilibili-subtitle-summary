@@ -1,0 +1,7 @@
+.workbuddy/
+node_modules/
+*.zip
+.DS_Store
+
+# 23 MB runtime binary is reproducibly restored from the pinned npm package.
+vendor/ort-wasm-simd-threaded.asyncify.wasm

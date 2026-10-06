@@ -1,0 +1,33 @@
+:root{font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;color:#202020;background:#fff;font-synthesis:none}
+*{box-sizing:border-box}
+body{margin:0;background:#fff}
+main{width:340px;padding:18px 18px 16px;border-top:4px solid #30302c;background:#fff}
+header{display:flex;align-items:center;gap:11px;padding-bottom:15px;border-bottom:1px solid #e3e3df}
+.mark{display:grid;place-items:center;width:48px;height:34px;border-radius:5px;background:#30302c;color:#fff;font-size:12px;font-weight:800;letter-spacing:1px}
+h1{margin:0;color:#1d1d1d;font-size:18px;line-height:1.25}
+header p{margin:4px 0 0;color:#777;font-size:10px;line-height:1.4}
+.state{display:flex;align-items:flex-start;gap:10px;margin:14px 0 12px;padding:11px 12px;border:1px solid #dededb;border-radius:6px;background:#fafaf8}
+.state>span{flex:0 0 8px;height:8px;margin-top:5px;border-radius:50%;background:#a2a29e}
+.state.running>span{background:#25845f}
+.state.error>span{background:#706e66}
+.state strong{color:#292929;font-size:12px}
+.state p{min-height:17px;margin:4px 0 0;color:#727272;font-size:11px;line-height:1.45}
+.actions{padding-bottom:13px;border-bottom:1px solid #e7e7e3}
+button,select{border-radius:5px;font:700 12px/1 system-ui,"Microsoft YaHei",sans-serif;cursor:pointer;transition:background .15s,border-color .15s,transform .1s}
+button{min-height:38px;padding:10px 12px;border:1px solid #d1d1cd;background:#fff;color:#303030}
+button:hover{border-color:#aaa;background:#f4f4f1}
+button:active{transform:translateY(1px)}
+button:focus-visible,select:focus-visible{outline:2px solid #202020;outline-offset:2px}
+button:disabled{opacity:.48;cursor:wait}
+.primary{width:100%;min-height:42px;border-color:#30302c;background:#30302c;color:#fff;font-size:13px}
+.primary:hover{border-color:#171715;background:#171715}
+.primary.running{border-color:#2f2f2f;background:#2f2f2f}
+.button-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+.destination{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:13px;color:#555;font-size:11px;font-weight:700}
+.destination select{min-width:142px;padding:9px 28px 9px 10px;border:1px solid #cececa;background:#fff;color:#282828}
+.settings{width:100%;margin-top:10px;border-color:transparent;background:transparent;color:#777;font-weight:600}
+.settings:hover{border-color:#dededb;background:#f7f7f5;color:#333}
+.success{color:#28765a!important}
+.error-text{color:#57564f!important}
+
+.capture-source{margin:0 0 10px}.capture-source select{max-width:205px}
