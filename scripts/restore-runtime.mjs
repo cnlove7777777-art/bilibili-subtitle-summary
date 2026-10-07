@@ -21,13 +21,30 @@ const vendor = join(root, 'vendor');
 const temp = await mkdtemp(join(tmpdir(), 'bscg-runtime-'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
-async function checkedCopy(source, targetName) {
-  const bytes = await readFile(source);
-  const actual = createHash('sha256').update(bytes).digest('hex');
+async function checkedCopyFromCandidates(candidates, targetName) {
   const expected = EXPECTED[targetName];
-  if (actual !== expected) throw new Error(`${targetName} SHA-256 mismatch: ${actual}`);
-  await copyFile(source, join(vendor, targetName));
-  console.log(`OK ${targetName} (${bytes.length} bytes)`);
+  const mismatches = [];
+  for (const source of candidates) {
+    let bytes;
+    try {
+      bytes = await readFile(source);
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      throw error;
+    }
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual !== expected) {
+      mismatches.push(`${source}: ${actual}`);
+      continue;
+    }
+    await copyFile(source, join(vendor, targetName));
+    console.log(`OK ${targetName} (${bytes.length} bytes) <- ${source}`);
+    return;
+  }
+  throw new Error(
+    `Unable to restore ${targetName}; no pinned candidate matched SHA-256 ${expected}` +
+    (mismatches.length ? `\nCandidates with different hashes:\n${mismatches.join('\n')}` : '')
+  );
 }
 
 try {
@@ -37,9 +54,19 @@ try {
     `onnxruntime-web@${ORT_VERSION}`
   ], { stdio: 'inherit' });
   await mkdir(vendor, { recursive: true });
-  await checkedCopy(join(temp, 'node_modules', '@huggingface', 'transformers', 'dist', 'transformers.min.js'), 'transformers.min.js');
+  const transformersDist = join(temp, 'node_modules', '@huggingface', 'transformers', 'dist');
+  const ortDist = join(temp, 'node_modules', 'onnxruntime-web', 'dist');
+  await checkedCopyFromCandidates(
+    [join(transformersDist, 'transformers.min.js')],
+    'transformers.min.js'
+  );
   for (const name of Object.keys(EXPECTED).filter(name => name !== 'transformers.min.js')) {
-    await checkedCopy(join(temp, 'node_modules', 'onnxruntime-web', 'dist', name), name);
+    const stem = name.endsWith('.mjs') ? name.slice(0, -4) : '';
+    await checkedCopyFromCandidates([
+      join(ortDist, name),
+      join(transformersDist, name),
+      ...(stem ? [join(transformersDist, `${stem}.js`)] : [])
+    ], name);
   }
 } finally {
   await rm(temp, { recursive: true, force: true });
