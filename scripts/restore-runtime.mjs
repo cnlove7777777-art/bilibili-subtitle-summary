@@ -21,23 +21,34 @@ const vendor = join(root, 'vendor');
 const temp = await mkdtemp(join(tmpdir(), 'bscg-runtime-'));
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
+async function readCandidate(source) {
+  if (/^https:\/\//i.test(source)) {
+    const response = await fetch(source, { redirect: 'follow' });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`HTTP ${response.status} while fetching ${source}`);
+    return Buffer.from(await response.arrayBuffer());
+  }
+  try {
+    return await readFile(source);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 async function checkedCopyFromCandidates(candidates, targetName) {
   const expected = EXPECTED[targetName];
   const mismatches = [];
   for (const source of candidates) {
-    let bytes;
-    try {
-      bytes = await readFile(source);
-    } catch (error) {
-      if (error?.code === 'ENOENT') continue;
-      throw error;
-    }
+    const bytes = await readCandidate(source);
+    if (!bytes) continue;
     const actual = createHash('sha256').update(bytes).digest('hex');
     if (actual !== expected) {
       mismatches.push(`${source}: ${actual}`);
       continue;
     }
-    await copyFile(source, join(vendor, targetName));
+    await mkdir(vendor, { recursive: true });
+    await import('node:fs/promises').then(({ writeFile }) => writeFile(join(vendor, targetName), bytes));
     console.log(`OK ${targetName} (${bytes.length} bytes) <- ${source}`);
     return;
   }
@@ -62,10 +73,13 @@ try {
   );
   for (const name of Object.keys(EXPECTED).filter(name => name !== 'transformers.min.js')) {
     const stem = name.endsWith('.mjs') ? name.slice(0, -4) : '';
+    const cdnName = name;
     await checkedCopyFromCandidates([
       join(ortDist, name),
       join(transformersDist, name),
-      ...(stem ? [join(transformersDist, `${stem}.js`)] : [])
+      ...(stem ? [join(transformersDist, `${stem}.js`)] : []),
+      `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/${cdnName}`,
+      `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/${cdnName}`
     ], name);
   }
 } finally {
