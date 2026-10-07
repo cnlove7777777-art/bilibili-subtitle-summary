@@ -12,21 +12,19 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Restore pinned browser ML runtime
-        run: node scripts/restore-runtime.mjs
       - name: Run review regressions
         run: node tests/review-regressions.mjs
       - name: Package verified source
         if: github.event_name == 'push'
         run: |
-          archive="browser-live-captions-${GITHUB_SHA::7}.zip"
+          archive="browser-live-captions-source-${GITHUB_SHA::7}.zip"
           zip -qr "$archive" . -x ".git/*" "$archive"
           echo "BSCG_ARCHIVE=$archive" >> "$GITHUB_ENV"
       - name: Upload verified source
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: browser-live-captions-${{ github.sha }}
+          name: browser-live-captions-source-${{ github.sha }}
           path: ${{ env.BSCG_ARCHIVE }}
           if-no-files-found: error
           retention-days: 7

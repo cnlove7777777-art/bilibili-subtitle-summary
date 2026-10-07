@@ -34,12 +34,14 @@
 
 ## 从源码安装
 
-为了让 Git 仓库保持轻量，约几十 MB 的浏览器 ML 运行库不提交到 Git。它们来自固定版本的 npm 包，并在恢复时做 SHA-256 校验：
+为了让 Git 仓库保持轻量，约几十 MB 的浏览器 ML 运行库不提交到 Git。**0.16.44 的完整发布 ZIP 已包含并校验这些运行库，推荐直接使用发布 ZIP做浏览器验收。**
+
+Git 仓库用于源码审查与开发。固定 npm 包可以恢复大部分浏览器 ML 运行库；但 0.16.43/0.16.44 实际使用的 `ort-wasm-simd-threaded.asyncify.{mjs,wasm}` 构建产物已经不在当前固定 npm 包的同名发布路径中，因此源码仓库不会假装它能 100% 从 npm 重建完整 CWS 包。若目录中已经包含发布 ZIP 的运行库，`node scripts/restore-runtime.mjs` 会先按 SHA-256 验证并复用它们。
 
 ```bash
 git clone https://github.com/cnlove7777777-art/bilibili-subtitle-summary.git
 cd bilibili-subtitle-summary
-node scripts/restore-runtime.mjs
+node tests/review-regressions.mjs
 ```
 
 然后打开 `chrome://extensions`：
@@ -48,12 +50,12 @@ node scripts/restore-runtime.mjs
 2. 点击“加载已解压的扩展程序”。
 3. 选择仓库目录。
 
-恢复脚本固定使用：
+运行库版本仍固定为：
 
 - `@huggingface/transformers@3.8.1`
 - `onnxruntime-web@1.22.0-dev.20250409-89f8206ba4`
 
-发布 ZIP 已包含这些运行库，不需要用户额外恢复。
+发布 ZIP 已包含 0.16.43 实际工作的完整 runtime，并按记录的 SHA-256 验证；GitHub Actions 负责源码回归，不再用一个已经缺少历史 asyncify 产物的 npm 发布结构冒充完整 CWS 打包验证。
 
 ## 验证
 

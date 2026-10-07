@@ -38,6 +38,17 @@ async function readCandidate(source) {
 
 async function checkedCopyFromCandidates(candidates, targetName) {
   const expected = EXPECTED[targetName];
+  const existing = join(vendor, targetName);
+  try {
+    const bytes = await readFile(existing);
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual === expected) {
+      console.log(`OK ${targetName} (${bytes.length} bytes) <- existing bundle`);
+      return;
+    }
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
   const mismatches = [];
   for (const source of candidates) {
     const bytes = await readCandidate(source);
