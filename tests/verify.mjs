@@ -110,7 +110,7 @@ test('JavaScript syntax and manifest version', () => {
     execFileSync(process.execPath, ['--check', root + file]);
   }
   const manifest = JSON.parse(source('manifest.json'));
-  assert.equal(manifest.version, '0.16.24');
+  assert.equal(manifest.version, '0.16.25');
   assert.equal(uiSource.match(/const CS_VERSION = '([^']+)'/)[1], manifest.version);
   assert.ok(manifest.permissions.includes('alarms'));
 });
@@ -854,8 +854,8 @@ test('The translation prompt keeps one line per caption and the reply is parsed 
 test('The translation module keeps request guards that would silently disable its timeouts', () => {
   // abortSignalFor 本身返回 signal；再取一层 .signal 会得到 undefined，超时彻底失效。
   assert.ok(!/abortSignalFor\([^)]*\)\.signal/.test(translateSource));
-  assert.match(translateSource, /const signal = abortSignalFor\(TRANSLATE_REQUEST_TIMEOUT_MS\);/);
-  assert.match(translateSource, /const signal = abortSignalFor\(TRANSLATE_MODEL_LIST_TIMEOUT_MS\);/);
+  assert.match(translateSource, /const signal = abortSignalFor\(TRANSLATE_REQUEST_TIMEOUT_MS, parentSignal\);/);
+  assert.match(translateSource, /const signal = abortSignalFor\(TRANSLATE_MODEL_LIST_TIMEOUT_MS\);/);\n  assert.match(translateSource, /cleanupAbortSignal\(signal\)/);
   assert.ok(!/Array\.isable/.test(translateSource), 'Array.isable 是拼写错误，会直接抛错');
   // 本地 GGUF 冷启动要几十秒，旧的 15/120 秒会在首帧就把整轨翻译判死。
   assert.match(translateSource, /TRANSLATE_MODEL_LIST_TIMEOUT_MS = 45 \* 1000/);
