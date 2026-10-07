@@ -778,6 +778,7 @@ function translatorHarness(translateLines, options = {}) {
     currentVideoTime: Number(options.position) || 0
   };
   const context = vm.createContext({
+    AbortController,
     LIVE_CAPTION_MAX_CHARACTERS: 18,
     MAX_LIVE_ROWS: 20000,
     setTimeout: () => 0,
