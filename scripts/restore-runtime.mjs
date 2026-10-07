@@ -79,7 +79,11 @@ try {
       join(transformersDist, name),
       ...(stem ? [join(transformersDist, `${stem}.js`)] : []),
       `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/${cdnName}`,
-      `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/${cdnName}`
+      `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/${cdnName}`,
+      ...(stem ? [
+        `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/${stem}.js`,
+        `https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TRANSFORMERS_VERSION}/dist/${stem}.js`
+      ] : [])
     ], name);
   }
 } finally {
