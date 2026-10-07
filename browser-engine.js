@@ -34,7 +34,10 @@ const DIRECT_LEAD_SECONDS = 1;
 const DIRECT_MIN_LEAD_SECONDS = 0.5;
 const DIRECT_MAX_LEAD_SECONDS = 2;
 const DIRECT_MAX_BYTES = 512 * 1024 * 1024;
-const HLS_MAX_NETWORK_BYTES = 2 * 1024 * 1024 * 1024;
+// HLS full-track decoding buffers media in JS memory. Oversized playlists
+// should fall back to live capture instead of risking multi-gigabyte offscreen allocations.
+const HLS_MAX_NETWORK_BYTES = 320 * 1024 * 1024;
+const HLS_MAX_SEGMENT_BYTES = 32 * 1024 * 1024;
 const HLS_MAX_FETCH_CONCURRENCY = 8;
 const HLS_STARTUP_SECONDS = 9;
 const HLS_MIN_STARTUP_SEGMENTS = 1;
@@ -2351,13 +2354,13 @@ async function downloadHlsAudio(state, manifestUrl) {
       if (state.stopping || activeSession !== state) throw engineError('任务已停止', 'TASK_CANCELLED');
       const batchEnd = Math.min(to, batchStart + concurrency);
       const buffers = await Promise.all(playlist.segments.slice(batchStart, batchEnd).map(async (segment) => {
-        const encrypted = await fetchResource(state, segment.url, 128 * 1024 * 1024);
+        const encrypted = await fetchResource(state, segment.url, HLS_MAX_SEGMENT_BYTES);
         return decryptHlsSegment(state, segment, encrypted, keyCache);
       }));
       for (let index = 0; index < buffers.length; index += 1) {
         const buffer = buffers[index];
         downloaded += buffer.byteLength;
-        if (downloaded > HLS_MAX_NETWORK_BYTES) throw new Error('HLS 下载量超过 2 GiB 安全限制');
+        if (downloaded > HLS_MAX_NETWORK_BYTES) throw new Error(`HLS 下载量超过 ${Math.round(HLS_MAX_NETWORK_BYTES / 1024 / 1024)} MiB 内存安全限制，将回退到实时取音`);
         segmentBuffers[batchStart + index] = buffer;
       }
       const completed = Math.min(playlist.segments.length, batchEnd);

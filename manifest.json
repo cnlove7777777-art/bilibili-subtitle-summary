@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "121",
   "name": "全网视频实时字幕与总结 · 浏览器识别 | Browser Live Captions & Summary",
-  "version": "0.16.24",
+  "version": "0.16.25",
   "description": "浏览器内完成语音转文字与实时字幕，无需单独部署大模型服务；支持 B站、YouTube 与通用视频网站，并可接本地/云端 API 翻译字幕、将字幕送往 AI 总结。",
   "permissions": [
     "storage",

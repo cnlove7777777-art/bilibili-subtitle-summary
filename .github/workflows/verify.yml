@@ -20,3 +20,17 @@ jobs:
           node tests/ui-summary-regressions.mjs
           node tests/model-bootstrap.mjs
           node tests/scan-audio.mjs
+      - name: Package verified source
+        if: github.event_name == 'push'
+        run: |
+          archive="browser-live-captions-${GITHUB_SHA::7}.zip"
+          zip -qr "$archive" . -x ".git/*" "$archive"
+          echo "BSCG_ARCHIVE=$archive" >> "$GITHUB_ENV"
+      - name: Upload verified source
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-live-captions-${{ github.sha }}
+          path: ${{ env.BSCG_ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 7

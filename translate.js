@@ -106,11 +106,29 @@
     return headers;
   }
 
-  function abortSignalFor(timeoutMs) {
+  const abortSignalCleanups = new WeakMap();
+
+  function abortSignalFor(timeoutMs, parentSignal = null) {
     const controller = new AbortController();
+    let parentAbort = null;
     const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 0));
-    controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (parentSignal && parentAbort) parentSignal.removeEventListener('abort', parentAbort);
+      abortSignalCleanups.delete(controller.signal);
+    };
+    if (parentSignal) {
+      parentAbort = () => controller.abort(parentSignal.reason);
+      if (parentSignal.aborted) controller.abort(parentSignal.reason);
+      else parentSignal.addEventListener('abort', parentAbort, { once: true });
+    }
+    controller.signal.addEventListener('abort', cleanup, { once: true });
+    abortSignalCleanups.set(controller.signal, cleanup);
     return controller.signal;
+  }
+
+  function cleanupAbortSignal(signal) {
+    abortSignalCleanups.get(signal)?.();
   }
 
   async function readResponseError(response) {
@@ -139,17 +157,23 @@
     try {
       response = await fetch(translateModelsUrl(config), { method: 'GET', headers: translateAuthHeaders(config), signal });
     } catch (error) {
+      cleanupAbortSignal(signal);
       throw new Error(`无法连接翻译服务：${error?.message || String(error)}`);
     }
-    if (!response.ok) {
-      const detail = await readResponseError(response);
-      throw new Error(
-        /^HTTP 40[13]/.test(detail) ? `${detail}（请确认 API Key 与 Base URL）` : `获取模型列表失败：${detail}`
-      );
+    let payload;
+    try {
+      if (!response.ok) {
+        const detail = await readResponseError(response);
+        throw new Error(
+          /^HTTP 40[13]/.test(detail) ? `${detail}（请确认 API Key 与 Base URL）` : `获取模型列表失败：${detail}`
+        );
+      }
+      payload = await response.json().catch((error) => {
+        throw new Error(`模型列表不是合法 JSON：${error?.message || String(error)}`);
+      });
+    } finally {
+      cleanupAbortSignal(signal);
     }
-    const payload = await response.json().catch((error) => {
-      throw new Error(`模型列表不是合法 JSON：${error?.message || String(error)}`);
-    });
     const entries = [];
     const seen = new Set();
     const push = (id, extra = {}) => {
@@ -212,8 +236,9 @@
       translateInFlight += 1;
       return releaseTranslateSlot;
     }
+    // Reserve the released slot before waking the waiter; otherwise one release
+    // can wake the whole queue before any resumed Promise increments the count.
     await new Promise((resolve) => translateSlotWaiters.push(resolve));
-    translateInFlight += 1;
     return releaseTranslateSlot;
   }
 
@@ -225,17 +250,18 @@
   function drainTranslateSlots() {
     while (translateSlotWaiters.length && translateInFlight < TRANSLATE_MAX_TOTAL_CONCURRENCY) {
       const resolve = translateSlotWaiters.shift();
+      translateInFlight += 1;
       resolve();
     }
   }
 
   // texts -> { ok, texts } 或 { ok:false, error }；调用方失败时应回退展示原文。
-  async function translateLines(config, texts) {
+  async function translateLines(config, texts, parentSignal = null) {
     const lines = (Array.isArray(texts) ? texts : []).map((line) => String(line || ''));
     if (!lines.length) return { ok: true, texts: [] };
     const release = await acquireTranslateSlot();
+    const signal = abortSignalFor(TRANSLATE_REQUEST_TIMEOUT_MS, parentSignal);
     try {
-      const signal = abortSignalFor(TRANSLATE_REQUEST_TIMEOUT_MS);
       const response = await fetch(translateCompletionsUrl(config), {
         method: 'POST',
         headers: translateAuthHeaders(config),
@@ -263,9 +289,16 @@
       }
       return { ok: true, texts: parsed.map((line) => line || '') };
     } catch (error) {
-      const aborted = error?.name === 'AbortError' || error?.name === 'TimeoutError';
-      return { ok: false, error: aborted ? `翻译请求超时（${Math.round(TRANSLATE_REQUEST_TIMEOUT_MS / 1000)} 秒）` : (error?.message || String(error)) };
+      const aborted = error?.name === 'AbortError' || error?.name === 'TimeoutError' || signal.aborted;
+      const cancelled = Boolean(parentSignal?.aborted);
+      return {
+        ok: false,
+        error: cancelled ? '翻译请求已取消' :
+          aborted ? `翻译请求超时（${Math.round(TRANSLATE_REQUEST_TIMEOUT_MS / 1000)} 秒）` :
+          (error?.message || String(error))
+      };
     } finally {
+      cleanupAbortSignal(signal);
       release();
     }
   }

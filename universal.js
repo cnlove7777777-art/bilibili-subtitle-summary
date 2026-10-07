@@ -234,7 +234,7 @@
     return;
   }
 
-  const CS_VERSION = '0.16.24'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
+  const CS_VERSION = '0.16.25'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
   let staleBg = false;        // 后台 service worker 版本落后于界面脚本（扩展更新后未重载）
 
   const DESTINATIONS = {

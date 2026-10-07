@@ -461,18 +461,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-chrome.action.onClicked.addListener(async (tab) => {
-  // 本地视频页诊断：未开启“允许访问文件网址”时，点击工具栏图标直接跳到开关页。
-  if (tab?.url && /^file:/i.test(tab.url)) {
-    const allowed = await new Promise((resolve) => chrome.extension.isAllowedFileSchemeAccess(resolve));
-    if (!allowed) {
-      await chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` });
-      return;
-    }
-  }
-  chrome.runtime.openOptionsPage();
-});
-
 chrome.tabs.onRemoved.addListener((tabId) => {
   observedMediaByTab.delete(tabId);
   documentByTab.delete(tabId);
@@ -2913,6 +2901,17 @@ function buildSrt(rows) {
   }).filter((block) => !block.endsWith('\n')).join('\n\n') + '\n';
 }
 
+function genericPageIdentity(value) {
+  const url = new URL(value || 'https://invalid.local/');
+  url.hash = '';
+  const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|autoplay|start|t|time_continue)$/i;
+  for (const key of [...url.searchParams.keys()]) {
+    if (transient.test(key)) url.searchParams.delete(key);
+  }
+  url.searchParams.sort();
+  return url.href;
+}
+
 function matchesLiveSource(session, candidateUrl) {
   try {
     const candidate = new URL(candidateUrl || 'https://invalid.local/');
@@ -2930,7 +2929,7 @@ function matchesLiveSource(session, candidateUrl) {
       const candidateId = candidate.searchParams.get('v') || candidate.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
       return candidateId === session.sourceVideoId;
     }
-    return candidate.href === source.href;
+    return genericPageIdentity(candidate.href) === genericPageIdentity(source.href);
   } catch {
     return false;
   }
@@ -4129,7 +4128,10 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
   // 前瞻字幕翻译：先把展示缓冲里最后一段落地并送翻，等翻译队列彻底清空后再读 rows，
   // 保证导出的 SRT、写入缓存与发去总结的文本同文同种（全是译文）。
   publishTranslatedCaptionSegment(session, null, true);
-  if (session.translator) await session.translator.finish().catch(() => {});
+  if (session.translator) {
+    if (session.stopRequested) session.translator.abort?.('用户停止字幕');
+    else await session.translator.finish().catch(() => {});
+  }
   const completionReason = String(inferenceMessage?.reason || inferenceMessage?.metrics?.completionReason || session.stopReason || 'unknown');
   pushLog('info', `[session] 任务收尾 tab=${session.tabId} mode=${session.mode} ` +
     `reason=${completionReason} 共 ${Array.isArray(session.rows) ? session.rows.length : 0} 段`);
@@ -4186,6 +4188,7 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
 async function failLiveCapture(session, error) {
   if (!session || session.finished) return;
   pushLog('error', `[session] 任务失败 tab=${session.tabId} mode=${session.mode}：${error}`);
+  session.translator?.abort?.(error || '字幕任务已停止');
   session.finished = true;
   releaseBorrowedTask(session);
   if (session.stopTimer) clearTimeout(session.stopTimer);
@@ -4462,6 +4465,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
   const pending = [];
   const queuedKeys = new Set();
   const heldRows = [];
+  const requestController = new AbortController();
   let inflight = null;
   let idleTimer = null;
   let stopped = false;
@@ -4509,6 +4513,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
   function abort(error) {
     if (stopped) return;
     stopped = true;
+    if (!requestController.signal.aborted) requestController.abort(error || 'translation-stopped');
     failure = String(error || '未知错误');
     pending.length = 0;
     if (idleTimer) {
@@ -4529,7 +4534,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
   }
 
   async function translateBatch(batch) {
-    const result = await translateLines(config, batch.map((row) => row.content));
+    const result = await translateLines(config, batch.map((row) => row.content), requestController.signal);
     if (!result.ok) throw new Error(result.error || '翻译请求失败');
     return batch.map((row, index) => {
       const text = cleanDisplayCaption(result.texts[index]);
@@ -4667,6 +4672,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
     pushBacklog,
     tick,
     finish,
+    abort,
     // 调用方要据此决定"还能不能延后显示"：一旦中止就必须立刻走识别原文上屏，
     // 否则延后的行永远不会被发出去，字幕会整段空白。用方法而非 getter，
     // 避免调用方解构后拿到一次性快照。
@@ -4888,6 +4894,7 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
     }
     void (async () => {
       const diagnostics = error?.metrics || {};
+      session.translator?.abort?.('整轨直取失败，切换实时取音');
       pushLog('warn', `[${source.platform || 'web'}/direct] 整轨直取失败，候选=${source.candidates?.length || 0} ` +
         `探测=${Number(diagnostics.directProbesStarted) || 0} 下载=${Number(diagnostics.directCandidatesTried) || 0} ` +
         `最后=${diagnostics.lastAudioCandidate || 'unknown'}；切换实时取音：${error?.message || error}`);

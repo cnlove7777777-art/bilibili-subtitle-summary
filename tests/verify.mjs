@@ -1073,3 +1073,56 @@ for (const { name, run } of tests) {
   catch (error) { console.error('FAIL ' + name + '\n' + error.stack); process.exitCode = 1; }
 }
 console.log(`${passed}/${tests.length} checks passed. GPU latency, VRAM, ASR accuracy and real tab audio remain hardware acceptance tests.`);
+
+
+test('Translation concurrency gate never exceeds four in-flight requests', async () => {
+  let active = 0;
+  let maximum = 0;
+  const context = vm.createContext({
+    AbortController,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await new Promise((resolve) => setTimeout(resolve, 8));
+      active -= 1;
+      return { ok: true, json: async () => ({ choices: [{ message: { content: '译文' } }] }) };
+    }
+  });
+  vm.runInContext(`${translateSource}\nglobalThis.api = BSCG_TRANSLATE;`, context);
+  const config = {
+    enabled: true, mode: 'remote', baseUrl: 'https://example.invalid/v1',
+    apiKey: '', model: 'test-model', targetLanguage: 'zh', displayMode: 'translated'
+  };
+  const results = await Promise.all(Array.from({ length: 12 }, () => context.api.translateLines(config, ['hello'])));
+  assert.ok(results.every((item) => item.ok));
+  assert.equal(maximum, 4);
+});
+
+test('Generic media identity ignores tracking/hash churn but keeps meaningful query changes', () => {
+  const context = vm.createContext({});
+  vm.runInContext(
+    fn(backgroundSource, 'genericPageIdentity') + '\n' +
+    fn(backgroundSource, 'matchesLiveSource') + '\n' +
+    'globalThis.matches = matchesLiveSource;',
+    context
+  );
+  const session = { sourcePlatform: 'web', sourceUrl: 'https://video.example/watch?id=abc&utm_source=feed#comments' };
+  assert.equal(context.matches(session, 'https://video.example/watch?utm_source=share&id=abc#player'), true);
+  assert.equal(context.matches(session, 'https://video.example/watch?id=def'), false);
+});
+
+test('Popup owns local-file permission recovery when an action popup is configured', () => {
+  const popupSource = source('popup.js');
+  assert.match(popupSource, /isAllowedFileSchemeAccess/);
+  assert.doesNotMatch(backgroundSource, /chrome\.action\.onClicked\.addListener/);
+});
+
+test('Published privacy text discloses automatic AI summary submission', () => {
+  const privacySource = source('privacy.html');
+  const readmeSource = source('README.md');
+  assert.match(privacySource, /自动触发该网页的 Send \/ Run 操作/);
+  assert.match(readmeSource, /附件就绪后\*\*自动提交\*\*/);
+  assert.doesNotMatch(privacySource, /不会替用户点击 Send \/ Run/);
+});
