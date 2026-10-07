@@ -1,0 +1,30 @@
+Chrome Web Store review notes — v0.16.44
+
+Single purpose
+This extension helps users obtain subtitles from web/local video and audio, generate local live captions, optionally translate those captions, and prepare the resulting transcript for summarization in a user-selected AI website.
+
+Final summary submission remains manual
+- Automatic message submission is NOT enabled.
+- When the user chooses ChatGPT, Google AI Studio (Gemini), or DeepSeek, the extension opens the official site, fills the prompt, and attaches the generated subtitle TXT.
+- The extension does NOT click Send / Run and does NOT submit the final message on the user's behalf.
+- The user must manually confirm final Send / Run.
+
+Translation
+- Browser-local ONNX/WebGPU translation is available and keeps subtitle content on device.
+- Local OpenAI-compatible translation sends subtitle text only to the Base URL configured by the user.
+- Remote OpenAI-compatible translation is optional and only runs after the user explicitly configures/enables it.
+- Per-video controls let the user follow the global setting, force translation on, or force it off.
+- In translated-only display mode, unverified source-language captions are not emitted as translated captions.
+
+Broad site access
+- http://*/*, https://*/* and file:///* are required because the product is designed for arbitrary video/audio pages and local media.
+- webRequest is used read-only to observe media/manifests and their response Content-Type for media discovery, including extensionless MSE/worker requests.
+- scripting runs packaged extension code in the current media page for discovery/capture fallbacks.
+- tabCapture is used after user action for tab-audio transcription.
+- offscreen hosts packaged local audio/ASR/translation runtime.
+- declarativeNetRequest installs temporary session-only Referer rules for extension-owned media fetches where required.
+- unlimitedStorage supports local ML model and transcript caches.
+- webNavigation keeps state aligned with SPA/history navigation.
+
+Remote code / model data
+All executable JavaScript and WebAssembly used by the extension package are bundled. Large ML model weights may be downloaded after installation as data for local inference; downloaded model files are not remote executable JavaScript.

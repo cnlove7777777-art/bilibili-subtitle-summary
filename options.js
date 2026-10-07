@@ -4,7 +4,7 @@ const DEFAULTS = {
   prompt: '完整总结视频字幕中的观点和内容。',
   aiStudioPrompt: '完整总结视频字幕中的观点和内容。',
   deepseekPrompt: '完整总结视频字幕中的观点和内容。',
-  language: 'zh',
+  language: 'zh', asrLanguage: 'auto',
   asrProfile: 'sensevoice_browser',
   asrBackend: 'auto',
   gpuPreference: 'high-performance',
@@ -29,20 +29,24 @@ const DEFAULTS = {
   translateRemoteBaseUrl: 'https://api.openai.com/v1',
   translateRemoteApiKey: '',
   translateRemoteModel: '',
+  translateOnnxModel: 'qwen3-0.6b-q4f16',
   translateTargetLanguage: 'zh',
   // translated：只显示译文（默认）；bilingual：译文为主 + 原文字号更小
-  translateDisplayMode: 'translated'
+  translateDisplayMode: 'translated',
+  // 开发者模式：日志落盘。字段名与后台 DEFAULTS 必须一致，否则改了存不进去。
+  logPersist: false
 };
 
 const fieldIds = [
-  'prompt', 'aiStudioPrompt', 'deepseekPrompt', 'language', 'asrProfile', 'asrBackend',
+  'prompt', 'aiStudioPrompt', 'deepseekPrompt', 'language', 'asrLanguage', 'asrProfile', 'asrBackend',
   'chatgptUrl', 'aiStudioUrl', 'deepseekUrl', 'defaultDestination',
   'liveChunkSeconds', 'recognitionThreads', 'scanPlaybackRate', 'voiceEnhancePreset',
   'translateMode', 'translateTargetLanguage', 'translateDisplayMode',
   'translateLocalBaseUrl', 'translateLocalApiKey', 'translateLocalModel',
-  'translateRemoteBaseUrl', 'translateRemoteApiKey', 'translateRemoteModel'
+  'translateRemoteBaseUrl', 'translateRemoteApiKey', 'translateRemoteModel',
+  'translateOnnxModel'
 ];
-const toggleIds = ['voiceEnhance', 'autoCaptionsMainstream', 'autoCaptionsOther', 'translateEnabled'];
+const toggleIds = ['voiceEnhance', 'autoCaptionsMainstream', 'autoCaptionsOther', 'translateEnabled', 'logPersist'];
 const NUMBER_FIELDS = {
   liveChunkSeconds: { min: 4, max: 12, fallback: 11.5 },
   recognitionThreads: { min: 0, max: 16, fallback: 0 },
@@ -158,18 +162,33 @@ const TRANSLATE_SOURCES = {
     list: 'translateRemoteModelList',
     hint: 'translateRemoteModelHint',
     label: '远程 API'
+  },
+  onnx: {
+    panel: 'translateOnnxPanel',
+    model: 'translateOnnxModel',
+    list: 'translateOnnxModelList',
+    hint: 'translateOnnxModelHint',
+    label: '浏览器 ONNX · WebGPU'
   }
 };
 const translateStatus = document.getElementById('translateStatus');
 
 function translateSourceKey() {
-  return elements.translateMode.value === 'remote' ? 'remote' : 'local';
+  return ['remote', 'onnx'].includes(elements.translateMode.value) ? elements.translateMode.value : 'local';
 }
 
 function translateLanguageLabel(code) {
   const select = elements.translateTargetLanguage;
   const option = [...select.options].find((candidate) => candidate.value === code);
   return option ? option.textContent : String(code || '');
+}
+
+function syncTranslationLanguages(changedId = '') {
+  const source = document.getElementById('translateSourceLanguage');
+  if (changedId === 'translateSourceLanguage') elements.language.value = source.value;
+  else source.value = elements.language.value;
+  document.getElementById('translatePromptPreview').textContent = BSCG_TRANSLATE.translateSystemPrompt(
+    elements.translateTargetLanguage.value, elements.language.value);
 }
 
 // 模型下拉：先保住已保存的选择，再并入服务端返回的列表；服务端列表里没有但已保存
@@ -183,7 +202,7 @@ function populateTranslateModels(select, models, selected) {
     if (!id || seen.has(id)) continue;
     seen.add(id);
     const quant = model?.quant ? ` · ${model.quant}` : '';
-    select.append(new Option(`${id}${quant}`, id));
+    select.append(new Option(`${model?.label || id}${quant}`, id));
   }
   if (value && !seen.has(value)) select.append(new Option(`${value}（已保存，不在当前列表）`, value));
   select.value = value;
@@ -212,11 +231,15 @@ async function load() {
   for (const id of fieldIds) elements[id].value = String(values[id]);
   for (const id of toggleIds) document.getElementById(id).checked = Boolean(values[id]);
   syncRecognitionControls(values.asrBackend);
+  syncTranslationLanguages();
   syncVoiceControls();
   for (const [name, source] of Object.entries(TRANSLATE_SOURCES)) {
+    if (name === 'onnx') continue;
     populateTranslateModels(document.getElementById(source.model), [], values[source.model]);
     void name;
   }
+  populateTranslateModels(document.getElementById('translateOnnxModel'),
+    [{ id: 'qwen3-0.6b-q4f16', label: 'Qwen3-0.6B · WebGPU Q4F16（约 570 MB）' }], values.translateOnnxModel);
   syncTranslatePanels();
   syncTranslateStatus();
   const model = values.asrProfile === 'qwen3_asr_0_6b' ? 'Qwen3-ASR 0.6B' : 'SenseVoice Small';
@@ -227,6 +250,7 @@ async function load() {
 
 function autoSave(event) {
   const changedId = event?.currentTarget?.id || '';
+  syncTranslationLanguages(changedId);
   if (changedId === 'asrProfile') syncRecognitionControls();
   const values = collectValues();
   for (const id of Object.keys(NUMBER_FIELDS)) elements[id].value = String(values[id]);
@@ -242,8 +266,8 @@ function autoSave(event) {
       applied = await chrome.runtime.sendMessage({ type: 'BSCG_BROWSER_SETTINGS_APPLIED' });
       if (!applied?.ok) throw new Error(applied?.error || '模型 Worker 切换失败');
     }
-    const audioChange = ['voiceEnhance', 'voiceEnhancePreset'].includes(changedId);
-    if (changedId.startsWith('translate')) {
+    const audioChange = ['voiceEnhance', 'voiceEnhancePreset', 'asrLanguage'].includes(changedId);
+    if (changedId.startsWith('translate') || changedId === 'language') {
       // 配置一变就把上一轮的试译结果清掉，避免拿旧结果当现配置的证据。
       syncTranslatePanels();
       syncTranslateStatus();
@@ -260,6 +284,7 @@ function autoSave(event) {
 for (const id of [...fieldIds, ...toggleIds]) {
   document.getElementById(id).addEventListener('change', autoSave);
 }
+document.getElementById('translateSourceLanguage').addEventListener('change', autoSave);
 document.getElementById('voiceEnhance').addEventListener('change', syncVoiceControls);
 
 function describeCapabilities(response, values = collectValues()) {
@@ -673,16 +698,16 @@ clearModelCacheButton.addEventListener('click', async () => {
 function syncTranslateStatus() {
   const values = collectValues();
   const source = TRANSLATE_SOURCES[translateSourceKey()];
-  const baseUrl = String(values[source.baseUrl] || '').trim();
+  const baseUrl = source.baseUrl ? String(values[source.baseUrl] || '').trim() : '';
   const model = String(values[source.model] || '').trim();
   const enabled = document.getElementById('translateEnabled').checked;
   const problems = [];
-  if (!/^https?:\/\//i.test(baseUrl)) problems.push('Base URL 不是 http/https');
+  if (source.baseUrl && !/^https?:\/\//i.test(baseUrl)) problems.push('Base URL 不是 http/https');
   if (!model) problems.push('还没选模型');
   translateStatus.dataset.state = '';
   translateStatus.textContent = problems.length
     ? `${enabled ? '已启用' : '未启用'} · ${source.label}：${problems.join('；')}。`
-    : `${enabled ? '已启用' : '未启用'} · ${source.label}：${model} → ${translateLanguageLabel(values.translateTargetLanguage)}\n${baseUrl}`;
+    : `${enabled ? '已启用' : '未启用'} · ${source.label}：${model} · ${values.language === 'auto' ? '自动识别' : BSCG_TRANSLATE.translateLanguageLabel(values.language)} → ${translateLanguageLabel(values.translateTargetLanguage)}${baseUrl ? `\n${baseUrl}` : ''}`;
 }
 
 document.getElementById('translateMode').addEventListener('change', () => {
@@ -735,7 +760,7 @@ document.getElementById('translateTest').addEventListener('click', async () => {
     ]);
     translateStatus.dataset.state = 'ok';
     translateStatus.textContent = [
-      `${response.mode === 'remote' ? '远程 API' : '本地服务'} · ${response.model} → ${translateLanguageLabel(response.targetLanguage)}`,
+      `${response.mode === 'onnx' ? '浏览器 ONNX · WebGPU' : response.mode === 'remote' ? '远程 API' : '本地服务'} · ${response.model} → ${translateLanguageLabel(response.targetLanguage)}`,
       ...pairs,
       '链路可用，可以开始识别了。'
     ].join('\n');
@@ -747,7 +772,57 @@ document.getElementById('translateTest').addEventListener('click', async () => {
   }
 });
 
-const logsOutput = document.getElementById('logsOutput');function formatLogLine(entry) {
+document.getElementById('translateBenchmark').addEventListener('click', async () => {
+  const button = document.getElementById('translateBenchmark');
+  const status = document.getElementById('translateBenchmarkStatus');
+  button.disabled = true;
+  status.textContent = '正在预热并顺序测试 6 个单句；首次调用含模型下载/加载。请先停止字幕与总结任务。';
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'BSCG_TRANSLATE_BENCHMARK', settings: collectValues() });
+    if (!response?.ok) throw new Error(response?.error || '测速失败');
+    const r = response.report;
+    status.textContent = [
+      `首次预热 ${Math.round(r.warmupMs)} ms（不计入稳态统计）`,
+      ...(r.sameLanguageAvoided ? [`源语言与目标相同，本次改用${BSCG_TRANSLATE.translateLanguageLabel(r.measuredSourceLanguage)}样本做跨语言测速（不更改设置）`] : []),
+      `单句中位数 ${Math.round(r.medianMs)} ms · P95 ${Math.round(r.p95Ms)} ms`,
+      `100 ms 参考：${r.meets100msTarget ? '达到' : '未达到'}；实时翻译保持可用`,
+      '这是单句翻译请求耗时，不含取音、断句、ASR、字幕显示，也不是整个链路测速。',
+      ...r.samples.map((text, i) => `${Math.round(r.timings[i])} ms · ${text}\n→ ${r.translations[i]}`)
+    ].join('\n');
+  } catch (error) { status.textContent = `测速失败：${error?.message || String(error)}`; }
+  finally { button.disabled = false; }
+});
+
+// ---- 07 日志：增量拉取 + 智能跟随 + 可选写入本地文件 ----
+// 【排查入口】日志内容由后台 pushLog 产生（约定说明见 background.js 日志区块）。
+// 本页只负责展示与落盘，不改写内容。按链路过滤请依赖消息前缀，例如
+// [translate] 前瞻翻译、[translate/realtime] 实时单句翻译、[browser] 取音引擎、
+// [browser/queue] 并发排队、[media/route] 取音路径决策、[session] 任务生命周期。
+// 拉取协议：BSCG_GET_LOGS + since（上次渲染的最大序号 n）。
+//   - since 之后的条目即新增；返回 truncated 说明 since 已被环形缓冲甩掉，
+//     此时必须整体重载，否则中间会缺一段日志而看不出断点。
+//   - 只是渲染层去重，序号由后台保证单调递增，本页不回写、不排序。
+const LOG_POLL_MS = 1000;
+const LOG_FOLLOW_THRESHOLD_PX = 40;
+
+const logsOutput = document.getElementById('logsOutput');
+const logsFileState = document.getElementById('logsFileState');
+const logsAutoButton = document.getElementById('logsAuto');
+const logsBindButton = document.getElementById('logsBindFile');
+const logsUnbindButton = document.getElementById('logsUnbindFile');
+
+let logCursor = 0;          // 已渲染的最大序号，作为下次增量拉取的 since
+let logPollTimer = null;    // 仅在日志分区可见时运行，避免后台无谓唤醒
+let logFollowing = true;    // 用户是否停在底部；向上翻阅时自动停止跟随
+let logFailNotice = '';     // 上一次失败原因，避免同一个错误每秒钟刷屏
+let logBoundHandle = null;  // 绑定到的本地文件句柄（File System Access API）
+let logBoundOffset = 0;     // 该文件当前字节长度，用于追加而不是覆盖
+let logFileQueue = Promise.resolve();
+let logFileSeen = new Set();
+let logPullBusy = false;
+const logEntryKey = entry => JSON.stringify([entry.t, entry.level, entry.msg]);
+
+function formatLogLine(entry) {
   const time = new Date(Number(entry.t) || Date.now());
   const pad = (value) => String(value).padStart(2, '0');
   const clock = `${pad(time.getHours())}:${pad(time.getMinutes())}:${pad(time.getSeconds())}`;
@@ -755,33 +830,186 @@ const logsOutput = document.getElementById('logsOutput');function formatLogLine(
   return `[${clock}] ${level}${entry.msg}`;
 }
 
-async function refreshLogs() {
+function logFileHeader() {
+  return `版本 ${chrome.runtime.getManifest().version} · ${navigator.userAgent} · ${new Date().toLocaleString()}`;
+}
+
+function atLogBottom() {
+  return logsOutput.scrollHeight - logsOutput.scrollTop - logsOutput.clientHeight < LOG_FOLLOW_THRESHOLD_PX;
+}
+
+logsOutput.addEventListener('scroll', () => { logFollowing = atLogBottom(); });
+
+function writeLogLine(text) {
+  logsOutput.appendChild(document.createTextNode(`${text}\n`));
+  if (logFollowing) logsOutput.scrollTop = logsOutput.scrollHeight;
+}
+
+function appendLogsToBoundFile(entries) {
+  const handle = logBoundHandle;
+  if (!handle || !entries.length) return Promise.resolve();
+  logFileQueue = logFileQueue.catch(() => {}).then(async () => {
+  if (logBoundHandle !== handle) return;
+  const fresh = entries.filter(entry => !logFileSeen.has(logEntryKey(entry)));
+  if (!fresh.length) return;
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS' });
-    if (!response?.ok) throw new Error(response?.error || '未知错误');
-    const logs = response.logs || [];
-    logsOutput.textContent = logs.length ? logs.map(formatLogLine).join('\n') : '暂无日志';
-    logsOutput.scrollTop = logsOutput.scrollHeight;
+    const chunk = `${fresh.map(formatLogLine).join('\n')}\n`;
+    const writable = await handle.createWritable({ keepExistingData: true });
+    await writable.seek(logBoundOffset);
+    await writable.write(chunk);
+    await writable.close();
+    logBoundOffset += new TextEncoder().encode(chunk).length;
+    fresh.forEach(entry => logFileSeen.add(logEntryKey(entry)));
+    while (logFileSeen.size > 8000) logFileSeen.delete(logFileSeen.values().next().value);
   } catch (error) {
-    logsOutput.textContent = `日志读取失败：${error?.message || String(error)}`;
+    const message = String(error?.message || error);
+    logBoundHandle = null;
+    updateLogFileState();
+    writeLogLine(`[!] 写入本地日志文件失败，已解除绑定：${message}`);
+  }
+  });
+  return logFileQueue;
+}
+
+function updateLogFileState() {
+  if (logBoundHandle) {
+    logsFileState.textContent = `已绑定：${logBoundHandle.name}（新日志实时追加；需保持本页打开）`;
+    logsBindButton.hidden = true;
+    logsUnbindButton.hidden = false;
+  } else {
+    logsFileState.textContent = '未绑定。绑定后新日志会实时追加到该文件，方便用编辑器直接跟踪；需保持本页打开。';
+    logsBindButton.hidden = false;
+    logsUnbindButton.hidden = true;
   }
 }
 
-document.getElementById('logsRefresh').addEventListener('click', refreshLogs);
+function setLogPolling(on) {
+  if (on && !logPollTimer) {
+    logPollTimer = setInterval(() => { if (!document.hidden) void pullLogs(true); }, LOG_POLL_MS);
+  } else if (!on && logPollTimer) {
+    clearInterval(logPollTimer);
+    logPollTimer = null;
+  }
+  logsAutoButton.textContent = logPollTimer ? '暂停刷新' : '继续刷新';
+}
+
+async function pullLogs(incremental = true) {
+  if (logPullBusy) return;
+  logPullBusy = true;
+  try {
+    const since = incremental ? logCursor : 0;
+    let response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS', since });
+    if (!response?.ok) throw new Error(response?.error || '未知错误');
+    if (incremental && response.truncated) {
+      incremental = false;
+      response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS', since: 0 });
+      if (!response?.ok) throw new Error(response?.error || '未知错误');
+    }
+    if (!incremental) {
+      logsOutput.textContent = '';
+      logCursor = 0;
+    }
+    const incoming = (response.logs || []).filter((entry) => (Number(entry.n) || 0) > logCursor);
+    logFailNotice = '';
+    if (!incoming.length) {
+      if (!incremental && !logsOutput.textContent) logsOutput.textContent = '暂无日志';
+      return;
+    }
+    const lines = incoming.map(formatLogLine);
+    writeLogLine(lines.join('\n'));
+    logCursor = Number(incoming[incoming.length - 1].n) || logCursor;
+    void appendLogsToBoundFile(incoming);
+  } catch (error) {
+    const message = String(error?.message || error);
+    if (message === logFailNotice) return;
+    logFailNotice = message;
+    writeLogLine(`[!] 日志读取失败：${message}`);
+  } finally { logPullBusy = false; }
+}
+
+document.getElementById('logsRefresh').addEventListener('click', () => { void pullLogs(false); });
+
 document.getElementById('logsClear').addEventListener('click', async () => {
   try { await chrome.runtime.sendMessage({ type: 'BSCG_CLEAR_LOGS' }); } catch {}
-  await refreshLogs();
+  logCursor = 0;
+  logFollowing = true;
+  await pullLogs(false);
 });
+
+document.getElementById('logsAuto').addEventListener('click', () => {
+  const running = logPollTimer !== null;
+  setLogPolling(!running);
+});
+
 document.getElementById('logsCopy').addEventListener('click', async () => {
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS' });
+    const response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS', since: 0 });
     const logs = response?.logs || [];
-    const header = `版本 ${chrome.runtime.getManifest().version} · ${navigator.userAgent} · ${new Date().toLocaleString()}\n`;
-    await navigator.clipboard.writeText(header + (logs.length ? logs.map(formatLogLine).join('\n') : '（日志为空）'));
+    await navigator.clipboard.writeText(`${logFileHeader()}\n` + (logs.length ? logs.map(formatLogLine).join('\n') : '（日志为空）'));
     showToast(`已复制 ${logs.length} 条日志`);
   } catch (error) {
     showToast(`复制失败：${error?.message || String(error)}`);
   }
+});
+
+// 一次性导出到浏览器下载目录。适合发给别人排查；要持续跟踪请用「绑定本地日志文件」。
+document.getElementById('logsExport').addEventListener('click', async () => {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS', since: 0 });
+    const logs = response?.logs || [];
+    const body = `${logFileHeader()}\n${logs.length ? logs.map(formatLogLine).join('\n') : '（日志为空）'}\n`;
+    const url = URL.createObjectURL(new Blob([body], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `bscg-log-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    showToast(`已导出 ${logs.length} 条日志`);
+  } catch (error) {
+    showToast(`导出失败：${error?.message || String(error)}`);
+  }
+});
+
+// 绑定真实文件并持续追加。Chrome 不允许扩展在后台静默写盘，句柄只能由本页持有，
+// 所以这个能力依赖设置页保持打开；页面关闭后需要重新绑定一次。
+document.getElementById('logsBindFile').addEventListener('click', async () => {
+  if (typeof window.showSaveFilePicker !== 'function') {
+    showToast('当前浏览器不支持绑定文件，请改用「导出 .log」');
+    return;
+  }
+  try {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: `bscg-log-${new Date().toISOString().slice(0, 10)}.log`,
+      types: [{ description: '日志文件', accept: { 'text/plain': ['.log', '.txt'] } }]
+    });
+    logBoundHandle = null;
+    await logFileQueue;
+    const existing = await handle.getFile();
+    const writable = await handle.createWritable({ keepExistingData: existing.size > 0 });
+    // 绑定即把当前缓冲区全量补齐，避免文件里只有绑定之后的新日志。
+    const response = await chrome.runtime.sendMessage({ type: 'BSCG_GET_LOGS', since: 0 });
+    const logs = response?.logs || [];
+    const prefix = existing.size > 0 ? '\n' : `${logFileHeader()}\n`;
+    const body = `${prefix}${logs.length ? logs.map(formatLogLine).join('\n') : '（日志为空）'}\n`;
+    await writable.seek(existing.size);
+    await writable.write(body);
+    await writable.close();
+    logBoundHandle = handle;
+    logFileSeen = new Set(logs.map(logEntryKey));
+    logBoundOffset = existing.size + new TextEncoder().encode(body).length;
+    updateLogFileState();
+    showToast(`已绑定 ${handle.name}，已写入 ${logs.length} 条日志`);
+  } catch (error) {
+    if (error?.name === 'AbortError') return;
+    showToast(`绑定失败：${error?.message || String(error)}`);
+  }
+});
+
+document.getElementById('logsUnbindFile').addEventListener('click', () => {
+  logBoundHandle = null;
+  logBoundOffset = 0;
+  updateLogFileState();
+  showToast('已解除本地日志文件绑定');
 });
 
 const navItems = [...document.querySelectorAll('.nav-item')];
@@ -795,12 +1023,16 @@ navItems.forEach((item) => item.addEventListener('click', () => {
   for (const section of document.querySelectorAll('.content > .card')) {
     section.hidden = section.id !== item.dataset.section;
   }
-  if (item.dataset.section === 'sec-logs') void refreshLogs();
+  // 轮询只在日志分区可见时开启：其它分页没有日志视图，没必要每秒唤醒后台。
+  const logsVisible = item.dataset.section === 'sec-logs';
+  if (logsVisible) void pullLogs(false);
+  setLogPolling(logsVisible);
 }));
 
 loadPromise = load();
 const requestedSection = location.hash.slice(1);
 if (requestedSection === 'sec-logs') navItems.find((item) => item.dataset.section === requestedSection)?.click();
+updateLogFileState();
 void loadPromise.then(() => inspectBrowserRuntime(debugStatus)).catch(() => {});
 
 document.getElementById('logsFeedback').addEventListener('click', () => {

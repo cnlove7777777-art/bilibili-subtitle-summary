@@ -1,102 +1,17 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light dark">
-  <title>隐私权政策｜任意视频总结与直播实时字幕</title>
-  <style>
-    :root { font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; line-height: 1.75; color: #202124; background: #f7f8fa; }
-    body { margin: 0; }
-    main { box-sizing: border-box; max-width: 820px; margin: 40px auto; padding: 40px 48px; background: #fff; border: 1px solid #e3e6eb; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,.05); }
-    h1 { margin: 0 0 8px; font-size: 2rem; }
-    h2 { margin-top: 2rem; font-size: 1.2rem; }
-    p, li { font-size: 1rem; }
-    .date { margin-top: 0; color: #687078; }
-    .note { padding: 12px 16px; border-left: 4px solid #0969da; background: rgba(9,105,218,.06); border-radius: 6px; }
-    a { color: #0969da; }
-    footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid #e3e6eb; color: #687078; }
-    @media (max-width: 700px) { main { margin: 0; padding: 28px 22px; border: 0; border-radius: 0; } }
-    @media (prefers-color-scheme: dark) {
-      :root { color: #e6edf3; background: #0d1117; }
-      main { background: #161b22; border-color: #30363d; box-shadow: none; }
-      .date, footer { color: #9da7b1; }
-      footer { border-color: #30363d; }
-      .note { background: rgba(88,166,255,.08); border-color: #58a6ff; }
-      a { color: #58a6ff; }
-    }
-  </style>
-</head>
-<body>
-<main>
-  <h1>隐私权政策</h1>
-  <p class="date">任意视频总结与直播实时字幕 · 本地识别<br>更新日期：2026年10月7日</p>
-
-  <p>本扩展用于从网页或本地视频/音频中获取或生成字幕、显示本地实时字幕、按用户选择进行字幕翻译，并在用户主动点击总结并选择目标服务后，将字幕和提示词提交到用户选择的 AI 网页用于总结。</p>
-
-  <h2>一、本地处理的数据</h2>
-  <p>扩展会在浏览器本地处理当前网页中的媒体信息、音频、字幕、转写结果、设置和运行状态。为发现可播放的媒体流，扩展可能观察当前标签页产生的媒体、播放清单或相关资源 URL；这些信息仅用于字幕提取、媒体定位和本地转写功能。</p>
-  <p>会话级媒体记录仅在浏览器本地短暂保存，并会随浏览器会话结束而清除。转写结果、设置和必要缓存可能保存在浏览器本地存储中，用于恢复字幕、避免重复识别和提升使用体验。</p>
-
-  <h2>二、本地语音识别与模型下载</h2>
-  <p>本扩展支持在用户设备上通过 WebGPU、WASM 或 ONNX 执行语音识别。相关语音识别模型可从 Hugging Face、HF Mirror、ModelScope 等模型托管服务下载并缓存在浏览器本地。</p>
-  <p>下载模型时，模型托管服务可能按照其自身政策获得普通网络请求信息，例如 IP 地址和 User-Agent；扩展不会把用户正在处理的音频、字幕或提示词上传给模型托管服务用于模型下载。</p>
-
-  <h2>三、将字幕准备到第三方 AI 网页</h2>
-  <p>当用户主动点击总结功能并选择 ChatGPT、Google AI Studio（Gemini）或 DeepSeek 时，扩展会生成或取得当前媒体字幕，打开用户选择的目标网页，将字幕 TXT 文件和总结提示词准备到该网页，并在确认附件已就绪后自动触发该网页的 Send / Run 操作。</p>
-  <p class="note"><strong>点击“总结”并选择目标服务会启动自动提交。</strong> 这是一次由用户主动发起的操作；提交后，字幕和提示词会由所选第三方 AI 服务按其自身政策处理。</p>
-  <p>字幕 TXT 文件在被上传到第三方网页时，相关内容可能已经传输至该第三方服务。此后数据由对应服务依据其自身隐私政策和服务条款处理。</p>
-
-  <h2>四、字幕翻译</h2>
-  <p>扩展支持以下翻译方式：</p>
-  <ul>
-    <li><strong>本地 OpenAI 兼容服务：</strong>字幕发送到用户自行配置的本地 Base URL（例如本机运行的 llama.cpp / LM Studio 等服务）。</li>
-    <li><strong>远程 OpenAI 兼容 API：</strong>仅在用户主动选择远程 API 并完成配置后，待翻译字幕文本才会发送到用户填写的 Base URL。</li>
-  </ul>
-  <p>用户配置的 API Key 保存在浏览器本地；发起远程翻译请求时，仅作为鉴权信息发送给用户配置的对应服务。远程服务如何处理字幕文本和鉴权信息，由该服务自己的隐私政策决定。</p>
-
-  <h2>五、网站媒体与字幕请求</h2>
-  <p>为了完成用户请求的字幕提取或本地识别，扩展可能访问当前媒体页面使用的字幕接口、媒体文件、HLS/DASH 播放清单或媒体分片，并观察与媒体播放相关的网络资源地址。</p>
-  <p>对部分站点，扩展可能为自身发起的媒体请求临时设置必要的 Referer 等请求信息，以取得当前媒体资源。这些规则仅用于媒体处理功能，不用于广告、跨站追踪或用户画像。</p>
-
-  <h2>六、本地存储与保留</h2>
-  <ul>
-    <li>扩展设置、用户配置和必要的运行状态可保存在 Chrome 扩展本地存储中。</li>
-    <li>语音识别或翻译模型可缓存到用户设备，以避免重复下载。</li>
-    <li>媒体发现记录、转写任务和临时数据只为完成用户发起的功能而保留，并会按会话或扩展清理逻辑删除。</li>
-  </ul>
-  <p>用户可通过扩展提供的清理功能、浏览器扩展数据管理功能或卸载扩展来移除相关本地数据。</p>
-
-  <h2>七、反馈与诊断</h2>
-  <p>当前发布版本未配置用于接收扩展诊断信息的在线反馈服务器。反馈页面可让用户在本地查看、复制或保存诊断信息；在未配置反馈服务器的情况下，这些信息不会发送给开发者。</p>
-  <p>如果未来启用在线反馈服务，本政策会在启用前更新，并在界面中明确说明会发送哪些数据。</p>
-
-  <h2>八、第三方服务</h2>
-  <p>用户主动使用相应功能时，可能涉及以下第三方服务：</p>
-  <ul>
-    <li>ChatGPT / OpenAI</li>
-    <li>Google AI Studio / Gemini</li>
-    <li>DeepSeek</li>
-    <li>用户自行配置的 OpenAI 兼容翻译 API</li>
-    <li>Hugging Face、HF Mirror、ModelScope（用于模型文件下载）</li>
-    <li>当前媒体网站自身的字幕、音频或视频服务器</li>
-  </ul>
-  <p>这些第三方服务独立处理其收到的数据，请同时查阅相应服务的隐私政策和使用条款。</p>
-
-  <h2>九、开发者不会做的事情</h2>
-  <p>开发者不运营用于收集用户视频、音频、字幕、提示词或浏览历史的服务器，不会出售用户数据，不会将浏览活动用于广告或用户画像，也不会将通过扩展权限获得的数据用于与本扩展公开功能无关的目的。</p>
-
-  <h2>十、权限与有限使用</h2>
-  <p>扩展申请的浏览器权限仅用于发现和访问用户正在处理的媒体资源、获取或生成字幕、保存用户设置、执行本地识别、按用户配置调用字幕翻译服务、维持用户发起的任务，以及把用户明确选择的内容提交到目标 AI 网页。</p>
-  <p>本扩展对通过浏览器权限获得的信息的使用遵守 Chrome Web Store 用户数据政策及其有限使用要求，数据处理限于本扩展公开说明的单一用途和用户可见功能。</p>
-
-  <h2>十一、用户控制</h2>
-  <p>用户可以决定是否启动字幕提取、本地识别、字幕翻译或 AI 总结流程，可以选择第三方服务、修改提示词和识别设置。AI 总结只有在用户主动点击总结并选择目标服务后才会启动；当前版本会在目标网页附件就绪后自动提交。</p>
-
-  <h2>十二、政策更新与联系</h2>
-  <p>当功能或数据处理方式发生变化时，本页面会同步更新。如有隐私或支持问题，请通过本项目的 <a href="https://github.com/cnlove7777777-art/bilibili-subtitle-summary/issues">GitHub Issues</a> 联系开发者。</p>
-
-  <footer>© 2026 任意视频总结与直播实时字幕</footer>
-</main>
-</body>
-</html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>隐私政策｜全网视频实时字幕与总结</title>
+<style>body{font:16px/1.75 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;max-width:820px;margin:40px auto;padding:0 24px;color:#202124}h1{line-height:1.2}h2{margin-top:2em}.note{padding:12px 16px;border-left:4px solid #0969da;background:#f3f7fc}code{background:#f3f4f6;padding:2px 5px;border-radius:4px}@media(prefers-color-scheme:dark){body{color:#e6edf3;background:#0d1117}.note{background:#161b22}}</style>
+</head><body>
+<h1>隐私政策</h1><p>全网视频实时字幕与总结 · v0.16.44<br>最后更新：2026-10-07</p>
+<p>本扩展用于从网页或本地视频/音频中获取或生成字幕、显示本地实时字幕、按用户选择进行字幕翻译，并在用户主动操作时将字幕准备到用户选择的 AI 网页用于总结。</p>
+<h2>1. 本地处理的数据</h2><p>扩展会在浏览器本地处理当前网页中的媒体信息、音频、字幕、转写结果、设置和运行状态。媒体/播放清单 URL 只用于媒体发现与字幕功能，并仅保留必要的本地或会话记录。</p><p>本地 ASR/翻译模型可从模型托管服务下载并缓存在浏览器中，用于 WebGPU/WASM/ONNX 推理。模型下载不会把用户正在处理的音频或字幕上传给模型托管服务。</p>
+<h2>2. 第三方 AI 总结</h2><p>当用户主动点击“总结”并选择 ChatGPT、Google AI Studio（Gemini）或 DeepSeek 时，扩展会准备字幕 TXT 和总结提示词到所选官方网页。</p><p class="note"><strong>扩展不会替用户点击 Send / Run，也不会自动提交最终消息。</strong> 用户必须在目标 AI 网页中手动确认最终发送。</p><p>字幕 TXT 与提示词一旦上传到第三方网页，即由相应第三方依据其隐私政策处理。</p>
+<h2>3. 字幕翻译</h2><ul><li>浏览器本地 ONNX/WebGPU：字幕在设备本地处理。</li><li>本地 OpenAI-compatible 服务：字幕发送到用户自行配置的本地 Base URL。</li><li>远程 OpenAI-compatible API：仅在用户主动配置并启用后发送待翻译字幕。API Key 保存在浏览器本地，只作为鉴权信息发往该 Base URL。</li></ul>
+<h2>4. 媒体与字幕请求</h2><p>扩展可能访问当前媒体页面的字幕接口、媒体文件、HLS/DASH 播放清单或分片，并为扩展自身的媒体请求临时设置必要的 Referer。相关能力不用于广告、跨站追踪或用户画像。</p>
+<h2>5. 反馈与诊断</h2><p>当前发布包未配置在线反馈服务器。反馈页面中的诊断信息在未配置服务器时不会发送给开发者。</p>
+<h2>6. 数据用途限制</h2><p>开发者不会出售用户数据，不会把浏览活动用于广告画像，也不会将通过扩展权限获得的数据用于与公开字幕/翻译/总结功能无关的目的。</p>
+<h2>7. 联系</h2><p>隐私与支持问题请通过项目 GitHub Issues：<code>cnlove7777777-art/bilibili-subtitle-summary</code>。</p>
+</body></html>

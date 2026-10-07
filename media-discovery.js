@@ -82,6 +82,54 @@ function bscgFindMedia(mode = 'clock') {
   if (mode === 'element') return best || null;
   if (!best) return null;
   const video = best.video;
+  if (mode === 'source') {
+    const direct = [video.currentSrc, video.src].find(value => /^(https?|file):/i.test(String(value || ''))) || '';
+    const classify = (url, kind = '') => kind || (/\.m3u8(?:$|[?#])/i.test(url) ? 'hls' : /\.mpd(?:$|[?#])/i.test(url) ? 'dash' : 'media');
+    const observed = Array.isArray(window.__BROWSER_SENSEVOICE_MEDIA_URLS__) ? window.__BROWSER_SENSEVOICE_MEDIA_URLS__ : [];
+    const pageIdentity = value => {
+      try {
+        const url = new URL(value);
+        url.hash = '';
+        const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
+        for (const key of [...url.searchParams.keys()]) if (transient.test(key)) url.searchParams.delete(key);
+        url.searchParams.sort();
+        return url.href;
+      } catch { return ''; }
+    };
+    const records = [...observed.filter(entry => ['hls', 'dash', 'media'].includes(entry.kind) &&
+      (!entry.pageUrl || pageIdentity(entry.pageUrl) === pageIdentity(location.href))).reverse()];
+    // Prefer the known parent of the most recent HLS child. The parent exposes
+    // lower bitrate variants without guessing URLs or picking another player.
+    const recentHls = records.find(entry => entry.kind === 'hls');
+    const parent = recentHls && records.find(entry => entry.manifestRole === 'master' && entry.variantUrls?.includes(recentHls.url));
+    if (parent) records.unshift(parent);
+    for (const entry of performance.getEntriesByType('resource').slice().reverse()) {
+      if (observed.some(record => record.url === entry.name)) continue;
+      if (/\.(?:m3u8|mpd|mp4|m4a|webm|mp3|aac|ogg|opus|flac|wav)(?:$|[?#])/i.test(entry.name || '')) {
+        records.push({ url: entry.name, kind: classify(entry.name), at: entry.startTime });
+      }
+    }
+    const candidates = [];
+    const add = entry => {
+      if (!/^(https?|file):/i.test(entry.url || '') || candidates.some(item => item.url === entry.url)) return;
+      candidates.push({ url: entry.url, kind: classify(entry.url, entry.kind), mimeType: entry.mimeType || '' });
+    };
+    if (direct) add(records.find(entry => entry.url === direct) || { url: direct });
+    // A usable currentSrc is authoritative. Network manifests are a fallback
+    // for a blob-backed player, rather than overriding a real direct source.
+    if (!direct) for (const entry of records) add(entry);
+    const first = candidates[0] || null;
+    // Even if the page exposes only blob:/MediaSource and no readable URL, keep
+    // the active media/frame identity. The service worker may still have seen
+    // extensionless HLS/DASH/audio requests through webRequest.
+    return { mediaUrl: first?.url || '', kind: first?.kind || '',
+      manifest: first?.kind === 'hls',
+      dashManifest: candidates.find(item => item.kind === 'dash')?.url || '', candidates,
+      referer: location.href, title: document.title || '',
+      currentTime: Math.max(0, Number(video.currentTime) || 0),
+      duration: Number.isFinite(video.duration) ? video.duration : 0,
+      playing: best.playing, score: best.score, mediaSrc: video.currentSrc || video.src || '' };
+  }
   return {
     currentTime: Math.max(0, Number(video.currentTime) || 0),
     duration: Number.isFinite(video.duration) ? video.duration : 0,

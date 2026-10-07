@@ -1,14 +1,13 @@
 {
   "manifest_version": 3,
   "minimum_chrome_version": "121",
-  "name": "全网视频实时字幕与总结 · 浏览器识别 | Browser Live Captions & Summary",
-  "version": "0.16.25",
-  "description": "浏览器内完成语音转文字与实时字幕，无需单独部署大模型服务；支持 B站、YouTube 与通用视频网站，并可接本地/云端 API 翻译字幕、将字幕送往 AI 总结。",
+  "name": "任意视频总结与直播实时字幕 · 本地识别 | Video Summary & Local Live Captions",
+  "version": "0.16.44",
+  "description": "纯浏览器本地字幕与视频总结辅助；可将字幕准备到 ChatGPT、Gemini 或 DeepSeek，发送前由用户确认。",
   "permissions": [
     "storage",
     "alarms",
     "scripting",
-    "activeTab",
     "tabCapture",
     "offscreen",
     "unlimitedStorage",
@@ -19,15 +18,7 @@
   "host_permissions": [
     "file:///*",
     "http://*/*",
-    "https://*/*",
-    "https://www.bilibili.com/*",
-    "https://api.bilibili.com/*",
-    "https://aisubtitle.hdslb.com/*",
-    "https://*.youtube.com/*",
-    "https://chatgpt.com/*",
-    "https://chat.openai.com/*",
-    "https://aistudio.google.com/*",
-    "https://chat.deepseek.com/*"
+    "https://*/*"
   ],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self'; connect-src 'self' https: http:"
@@ -48,7 +39,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_title": "全网视频实时字幕与总结 · 浏览器识别 | Browser Live Captions & Summary",
+    "default_title": "任意视频总结与直播实时字幕 · 本地识别 | Video Summary & Local Live Captions",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

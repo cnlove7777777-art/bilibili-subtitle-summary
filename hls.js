@@ -47,6 +47,8 @@
     let initMap = null;
     let unsupportedByteRange = false;
     let endList = false;
+    let discontinuity = 0;
+    let timeline = 0;
 
     for (const line of lines.slice(1)) {
       if (line.startsWith('#EXT-X-STREAM-INF:')) {
@@ -59,6 +61,7 @@
             default: attributes.DEFAULT === 'YES',
             autoselect: attributes.AUTOSELECT === 'YES',
             language: attributes.LANGUAGE || '',
+            groupId: attributes['GROUP-ID'] || '',
             name: attributes.NAME || ''
           });
         }
@@ -85,6 +88,8 @@
         };
       } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
         unsupportedByteRange = true;
+      } else if (line === '#EXT-X-DISCONTINUITY') {
+        discontinuity += 1;
       } else if (line === '#EXT-X-ENDLIST') {
         endList = true;
       } else if (!line.startsWith('#')) {
@@ -98,7 +103,9 @@
           });
           streamInfo = null;
         } else {
-          segments.push({ url, duration, sequence: nextSequence++, key: key ? { ...key } : null });
+          segments.push({ url, duration, sequence: nextSequence++, key: key ? { ...key } : null,
+            initMap: initMap ? { ...initMap } : null, discontinuity, start: timeline, end: timeline + duration });
+          timeline += duration;
           duration = 0;
         }
       }
@@ -115,6 +122,20 @@
       unsupportedByteRange,
       endList
     };
+  }
+
+  function planWindow(segments, time, seconds = 30) {
+    const target = Math.max(0, Number(time) || 0);
+    let at = segments.findIndex(segment => segment.end > target + 0.025);
+    if (at < 0) return null;
+    const context = segment => JSON.stringify([segment.discontinuity || 0, segment.initMap?.url || '',
+      segment.initMap?.key?.url || '', segment.initMap?.key?.iv || '']);
+    if (at > 0 && context(segments[at - 1]) === context(segments[at])) at -= 1;
+    let end = at + 1;
+    const until = target + Math.max(1, Number(seconds) || 30);
+    while (end < segments.length && segments[end - 1].end < until && context(segments[end]) === context(segments[at])) end += 1;
+    return { from: at, to: end, start: segments[at].start, end: segments[end - 1].end,
+      requestedTime: target, complete: end === segments.length };
   }
 
   function readSection(payload, payloadUnitStart) {
@@ -248,5 +269,5 @@
     return Uint8Array.from({ length: 16 }, (_, index) => parseInt(hex.slice(index * 2, index * 2 + 2), 16));
   }
 
-  self.BrowserHls = Object.freeze({ parsePlaylist, parseIv, TsAudioDemuxer });
+  self.BrowserHls = Object.freeze({ parsePlaylist, planWindow, parseIv, TsAudioDemuxer });
 })();

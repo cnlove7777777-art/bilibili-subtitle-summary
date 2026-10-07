@@ -160,24 +160,8 @@
     if (attached.ok) {
       await chrome.storage.local.remove(key);
       if (attached.sent) return; // 用户已经手动发出，不需要再提示
-      if (payload.autoSend) {
-        // autoSend 模式：附件就绪后直接点击发送按钮。
-        const start = Date.now();
-        let sent = false;
-        while (Date.now() - start < 20000 && !sent) {
-          const sendButton = [...document.querySelectorAll('button')]
-            .find((item) => (/发送|send/i.test(`${item.getAttribute('aria-label') || ''}${item.textContent || ''}`)) && !item.disabled);
-          if (sendButton) {
-            sendButton.click();
-            sent = true;
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 300));
-        }
-        showBanner(sent ? '已自动发送：字幕 TXT 与提示词已提交给 DeepSeek。' : '自动发送没有完成：发送按钮未就绪。内容已填好，可手动点击发送。', !sent);
-      } else {
-        showBanner('字幕 TXT 和提示词已经放入 DeepSeek；检查后再发送。');
-      }
+      // 最终发送必须由用户确认；扩展不代替用户提交。
+      showBanner('字幕 TXT 和提示词已经放入 DeepSeek；请检查内容和目标后，再手动点击发送。');
     } else {
       // 只有"收件区里确实没有本次附件、且消息也还没发出去"时才提示。
       showBanner('没有确认到附件卡片，已停止自动操作（不会上传或发送不完整的字幕）。' +

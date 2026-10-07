@@ -80,7 +80,7 @@ $('extract').addEventListener('click', () => run($('extract'), async () => {
   const response = await chrome.runtime.sendMessage({ type: 'BSCG_EXTRACT_CURRENT', tabId: currentTab.id, destination: destination.value });
   if (!response?.ok) throw new Error(response?.error || '字幕提取失败');
   show(response.needsLiveCapture || response.needsLocalConfirm ? '没有现成字幕' : '字幕已提取',
-    response.needsLiveCapture || response.needsLocalConfirm ? '点击“开始字幕”生成。' : '已发送到所选网页。');
+    response.needsLiveCapture || response.needsLocalConfirm ? '点击“开始字幕”生成。' : '已打开所选网页，请检查后手动发送。');
 }));
 $('export').addEventListener('click', () => run($('export'), async () => {
   currentTab ||= await activeTab();

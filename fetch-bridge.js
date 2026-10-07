@@ -11,7 +11,7 @@
     const data = event.data;
     if (event.source !== window || data?.marker !== 'BROWSER_SENSEVOICE_PAGE_FETCH_V1') return;
     const requestId = String(data.requestId || '');
-    if (!armed.has(requestId) || !['start', 'chunk', 'end', 'error'].includes(data.type)) return;
+    if (!armed.has(requestId) || !['progress', 'start', 'chunk', 'end', 'error'].includes(data.type)) return;
     if (data.type === 'chunk' && (typeof data.data !== 'string' || data.data.length > 400000)) return;
     chrome.runtime.sendMessage({
       target: 'offscreen',

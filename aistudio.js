@@ -166,24 +166,12 @@
     }
     if (attached.ok) {
       await chrome.storage.local.remove(key);
-      if (attached.sent) return; // 用户已经手动发出，不需要再提示
-      if (payload.autoSend) {
-        // autoSend 模式：附件就绪后直接点击 Run，一次完成总结。
-        const start = Date.now();
-        let sent = false;
-        while (Date.now() - start < 20000 && !sent) {
-          const runButton = [...document.querySelectorAll('button, .run-button')].find((item) => /^run$/i.test(String(item.textContent || '').trim()) && !item.disabled);
-          if (runButton) {
-            runButton.click();
-            sent = true;
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 300));
-        }
-        showBanner(sent ? '已自动发送：字幕 TXT 与提示词已提交给 Google AI Studio。' : '自动发送没有完成：Run 按钮未就绪。内容已填好，可手动点击 Run。', !sent);
-      } else {
-        showBanner('字幕 TXT 和提示词已经放入 Google AI Studio；检查后再点击 Run。');
-      }
+      // 附件卡片在 AI Studio 发送后会留在对话里，仅凭"附件还在"无法判断消息是否已经
+      // 发出。补一次"编辑器是否已清空"的复核：已发出就直接结束，不要再去点 Run。
+      // （旧表现：已开始流式输出，却仍弹"Run 按钮未就绪"红字。）
+      if (attached.sent || messageAlreadySent(editor)) return;
+      // 最终 Run 必须由用户确认；扩展不代替用户提交。
+      showBanner('字幕 TXT 和提示词已经放入 Google AI Studio；请检查内容和目标后，再手动点击 Run。');
     } else {
       showBanner('没有确认到附件卡片，已停止自动操作（不会上传或发送不完整的字幕）。' +
         '可点击下方按钮直接下载本次字幕 TXT 核对内容。', true, [

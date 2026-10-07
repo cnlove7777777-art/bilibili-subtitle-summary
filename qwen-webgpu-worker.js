@@ -360,10 +360,11 @@ function causalMask(sequenceLength, pastLength) {
   const totalLength = pastLength + sequenceLength;
   const masked = floatToHalf(MASKED_FP16);
   const data = new Uint16Array(sequenceLength * totalLength);
-  data.fill(masked);
   for (let row = 0; row < sequenceLength; row += 1) {
     const rowOffset = row * totalLength;
-    for (let column = 1; column < pastLength + row + 1; column += 1) data[rowOffset + column] = 0;
+    // Typed arrays start at zero: only write the dummy past token and future.
+    data[rowOffset] = masked;
+    data.fill(masked, rowOffset + pastLength + row + 1, rowOffset + totalLength);
   }
   return new Tensor('float16', data, [1, 1, sequenceLength, totalLength]);
 }
@@ -481,19 +482,42 @@ function createTokenizer(config) {
     if (token.special) specials.add(Number(token.id));
   }
   if (!byId.length) throw new Error('Qwen tokenizer.json 没有可用词表');
+  const encoder = new TextEncoder();
+  const tokenBytes = new Map();
+  function bytesFor(id) {
+    if (tokenBytes.has(id)) return tokenBytes.get(id);
+    const token = byId[id];
+    const bytes = [];
+    if (typeof token === 'string' && (!specials.has(id) || token === '<asr_text>')) {
+      for (const character of token) {
+        const byte = byteDecoder.get(character);
+        if (byte !== undefined) bytes.push(byte);
+        else bytes.push(...encoder.encode(character));
+      }
+    }
+    const result = Uint8Array.from(bytes);
+    tokenBytes.set(id, result);
+    return result;
+  }
   return {
+    // Each transcription owns its stream. Consume only newly appended tokens;
+    // TextDecoder retains incomplete UTF-8 bytes across token boundaries.
+    createStream() {
+      const decoder = new TextDecoder('utf-8', { fatal: false });
+      let consumed = 0;
+      let raw = '';
+      return {
+        decode(ids) {
+          for (; consumed < ids.length; consumed++) {
+            raw += decoder.decode(bytesFor(ids[consumed]), { stream: true });
+          }
+          return raw.includes('<asr_text>') ? parseQwenAsrText(raw).replace(/\uFFFD+$/u, '') : '';
+        }
+      };
+    },
     decode(ids, { partial = false } = {}) {
       const bytes = [];
-      for (const id of ids) {
-        const token = byId[id];
-        if (specials.has(id) && token !== '<asr_text>') continue;
-        if (typeof token !== 'string') continue;
-        for (const character of token) {
-          const byte = byteDecoder.get(character);
-          if (byte !== undefined) bytes.push(byte);
-          else bytes.push(...new TextEncoder().encode(character));
-        }
-      }
+      for (const id of ids) for (const byte of bytesFor(id)) bytes.push(byte);
       const raw = new TextDecoder('utf-8', { fatal: false }).decode(Uint8Array.from(bytes));
       // Do not stream the language header or an incomplete UTF-8 character.
       if (partial && !raw.includes('<asr_text>')) return '';
@@ -709,6 +733,7 @@ async function transcribe(message) {
   let lastPartialText = '';
   let partialIndex = 0;
   let firstPartialMs = 0;
+  const partialDecoder = message.stream ? tokenizer.createStream?.() : null;
   try {
     const text = await generate(audio, (phase) => emit('inference-progress', {
       sessionId: message.sessionId, phraseId: message.phraseId,
@@ -717,7 +742,7 @@ async function transcribe(message) {
       phase, backend: 'webgpu'
     }), (ids) => {
       if (!message.stream || request.cancelled || performance.now() - lastPartialAt < 120) return;
-      const partial = tokenizer.decode(ids, { partial: true });
+      const partial = partialDecoder ? partialDecoder.decode(ids) : tokenizer.decode(ids, { partial: true });
       if (!partial || partial === lastPartialText) return;
       lastPartialAt = performance.now();
       lastPartialText = partial;

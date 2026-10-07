@@ -26,7 +26,7 @@
     return /\.(?:m3u8|mpd)(?:$|[?#])/i.test(url) || isFragment(url) || mediaFile(url) ||
       /(?:^|\.)googlevideo\.com\/videoplayback/i.test(url);
   };
-  const remember = (value, kind = '') => {
+  const remember = (value, kind = '', metadata = {}) => {
     try {
       const url = new URL(String(value || ''), location.href).href;
       if (!/^https?:/i.test(url) || (!kind && !isInteresting(url))) return;
@@ -37,9 +37,13 @@
       }
       if (kind === 'media' && isFragment(url)) kind = 'fragment';
       const key = `${kind}\n${url}`;
-      if (seen.has(key)) return;
+      if (seen.has(key)) {
+        const existing = records.find(record => record.url === url && record.kind === kind);
+        if (existing) Object.assign(existing, { pageUrl: location.href }, metadata);
+        return;
+      }
       seen.add(key);
-      records.push({ url, kind, at: performance.now() });
+      records.push({ url, kind, at: performance.now(), pageUrl: location.href, ...metadata });
       while (records.length > 240) {
         const removed = records.shift();
         seen.delete(`${removed.kind}\n${removed.url}`);
@@ -47,6 +51,39 @@
     } catch {
       // Invalid or opaque URLs are not useful to the direct-track reader.
     }
+  };
+
+  const inspectHls = (url, text, pageUrl = location.href) => {
+    if (typeof text !== 'string' || text.length > 262144 || !text.trimStart().startsWith('#EXTM3U')) return;
+    const lines = text.split(/\r?\n/).map(line => line.trim());
+    const variants = [];
+    for (let i = 0; i < lines.length && variants.length < 32; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF:')) continue;
+      const uri = lines.slice(i + 1).find(line => line && !line.startsWith('#'));
+      if (uri) { try { variants.push(new URL(uri, url).href); } catch {} }
+    }
+    remember(url, 'hls', { pageUrl, manifestRole: variants.length ? 'master' : 'media', variantUrls: variants });
+  };
+
+  const inspectFetchedHls = async (response, url) => {
+    const pageUrl = location.href;
+    const reader = response.clone().body?.getReader();
+    if (!reader) return;
+    const chunks = [];
+    let size = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > 262144) { void reader.cancel().catch(() => {}); return; }
+        chunks.push(value);
+      }
+      const bytes = new Uint8Array(size);
+      let offset = 0;
+      for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+      inspectHls(url, new TextDecoder().decode(bytes), pageUrl);
+    } finally { reader.releaseLock(); }
   };
 
   Object.defineProperty(window, '__BROWSER_SENSEVOICE_MEDIA_URLS__', {
@@ -97,8 +134,12 @@
       const requestedPage = location.href;
       remember(requestUrl);
       return nativeFetch.apply(this, args).then((response) => {
+        if (requestedPage !== location.href) return response;
         const type = response.headers?.get('content-type') || '';
-        if (/mpegurl/i.test(type)) remember(response.url || requestUrl, 'hls');
+        if (/mpegurl/i.test(type)) {
+          remember(response.url || requestUrl, 'hls');
+          void inspectFetchedHls(response, response.url || requestUrl).catch(() => {});
+        }
         else if (/dash\+xml/i.test(type)) remember(response.url || requestUrl, 'dash');
         else if (/^audio\//i.test(type)) remember(response.url || requestUrl, isFragment(response.url || requestUrl) ? 'audio-fragment' : 'media');
         else if (/^video\//i.test(type)) remember(response.url || requestUrl, 'media');
@@ -119,10 +160,15 @@
       remember(url);
       this.addEventListener('load', () => {
         try {
+          if (requestedPage !== location.href) return;
           const responseUrl = this.responseURL || url;
           const type = this.getResponseHeader('content-type') || '';
           if (/mpegurl/i.test(type)) {
             remember(this.responseURL || url, 'hls');
+            const text = this.responseType === 'arraybuffer' && this.response?.byteLength <= 262144
+              ? new TextDecoder().decode(this.response)
+              : !this.responseType || this.responseType === 'text' ? this.responseText : '';
+            inspectHls(responseUrl, text);
           } else if (/dash\+xml/i.test(type)) {
             remember(this.responseURL || url, 'dash');
           } else if (/^audio\//i.test(type)) {

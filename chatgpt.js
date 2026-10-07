@@ -209,24 +209,7 @@
     location.reload();
   }
 
-  // autoSend 模式：附件就绪后直接点击发送，一次完成总结，不再等用户检查。
-  function findSendButton() {
-    return [...document.querySelectorAll('button')]
-      .find((button) => (button.id === 'composer-submit-btn' || button.dataset?.testid === 'send-button' || /send|发送/i.test(`${button.getAttribute('aria-label') || ''}${button.dataset?.testid || ''}`)) && !button.disabled);
-  }
-
-  async function autoSendWhenReady() {
-    const start = Date.now();
-    while (Date.now() - start < 20000) {
-      const button = findSendButton();
-      if (button) {
-        button.click();
-        return true;
-      }
-      await sleep(300);
-    }
-    return false;
-  }
+  // 最终发送由用户确认。扩展只准备提示词与附件，不点击发送按钮。
 
   function clearDeliveryQuery() {
     const url = new URL(location.href);
@@ -264,12 +247,9 @@
     } else if (upload.status === 'attached') {
       await chrome.storage.local.remove(key);
       clearDeliveryQuery();
-      if (payload.autoSend) {
-        const sent = await autoSendWhenReady();
-        showBanner(sent ? '已自动发送：字幕 TXT 与提示词已提交，可在本页查看总结。' : '自动发送没有完成：发送按钮未就绪。内容已填好，可手动点击发送。', !sent, [], sent ? 7000 : 0);
-      } else {
-        showBanner('字幕 TXT 已上传，提示词也已填好；检查后再发送。', false, [], 7000);
-      }
+      // 用户若已经手动发出则无需重复提示；否则停在编辑器中等待用户确认。
+      if (alreadySent) return;
+      showBanner('字幕 TXT 已上传，提示词也已填好；请检查内容和发送目标后，再手动点击发送。', false, [], 0);
     } else if (upload.status === 'failed') {
       showBanner('ChatGPT 报告附件上传失败。本页不会自动重复上传，以免卡住；可刷新后重试。', true, [
         { label: '刷新页面重试', run: retryPage },

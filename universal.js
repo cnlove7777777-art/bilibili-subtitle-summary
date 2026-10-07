@@ -1,10 +1,15 @@
 (function () {
   'use strict';
 
-  function captionDisplayRows(timeline, hold, holdUntil, preview, now) {
-    const finalRow = hold?.content && now < holdUntil ? hold : timeline;
+  function captionDisplayRows(timeline, hold, holdUntil, preview, now, currentTime = Infinity, replayUntil = 0) {
+    // Replaying a cached interval always wins over a late result from elsewhere.
+    if (timeline?.content) return [{ ...timeline, provisional: false }];
+    if (currentTime < replayUntil) return [];
+    const finalRow = hold?.content && now < holdUntil && Number(hold.from) <= currentTime + 0.18 ? hold : null;
+    if (preview && Number(preview.from) > currentTime + 0.18) preview = null;
     const draft = preview?.content && (!finalRow?.id || finalRow.id !== preview.id) &&
       (!finalRow || Number(preview.from) >= Number(finalRow.from) - 0.05) ? preview : null;
+    if (draft?.singleLine && !finalRow) return [{ ...draft, provisional: true }];
     return [finalRow?.content ? { ...finalRow, provisional: false } : null,
       draft ? { ...draft, provisional: true } : null].filter(Boolean);
   }
@@ -234,7 +239,7 @@
     return;
   }
 
-  const CS_VERSION = '0.16.25'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
+  const CS_VERSION = '0.16.44'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
   let staleBg = false;        // 后台 service worker 版本落后于界面脚本（扩展更新后未重载）
 
   const DESTINATIONS = {
@@ -261,46 +266,67 @@
     <style>
       :host{all:initial;--ink:#243342;--sub:#7b8aa0;--line:#d7e6fa;--paper:#ffffff;--primary:#2f7cf6;--primary-deep:#1f66d6;--tint:#eaf3ff}
       button{font:700 12px/1.2 system-ui,"Microsoft YaHei",sans-serif}
-      /* 入口竖条：贴视频画面左侧、垂直居中（无可定位视频时退回页面左侧居中），JS 每次刷新位置 */
-      #dock{position:fixed;left:14px;top:120px;pointer-events:auto;display:flex;flex-direction:column;width:46px;filter:drop-shadow(0 6px 16px rgba(47,124,246,.25))}
-      #dock>button{display:block;box-sizing:border-box;width:46px;height:46px;padding:0;border:1px solid var(--line);background:var(--paper);color:var(--primary);font:800 12px/1.2 system-ui,"Microsoft YaHei",sans-serif;letter-spacing:2px;text-indent:2px;cursor:pointer;transition:background .15s,color .15s,transform .1s}
-      #cap-btn{border-radius:12px 12px 0 0;border-bottom:0}
-      #sum-btn{border-radius:0 0 12px 12px;border-top:0}
+      /* 左下角入口：折叠态只露出一小截色条，悬停色条（或键盘聚焦）才展开。
+         折叠态 #dock 必须 pointer-events:none —— 否则整块预留区域（原 58×114）都会
+         吃 hover，鼠标扫过"按钮原本占的位置"就自动展开，等于没折叠。 */
+      #dock{position:fixed;left:0;top:50%;bottom:auto;transform:translateY(-50%);pointer-events:none;display:flex;flex-direction:column;width:40px;padding-left:8px;box-sizing:border-box;filter:drop-shadow(0 5px 11px rgba(47,124,246,.25))}
+      #dock::before{content:"";position:absolute;left:2px;top:0;bottom:0;width:1.25px;border-radius:999px;background:linear-gradient(180deg,#70bbff,#2f7cf6 55%,#1f66d6);opacity:.85;transition:opacity .22s ease;pointer-events:none}
+      /* 折叠态唯一可命中的区域：色条左右各留 2~3px 的透明条，够好点又不会覆盖到
+         隐藏按钮的那一列（按钮列从 padding-left:8px 起）。 */
+      #dock::after{content:"";position:absolute;left:0;top:0;bottom:0;width:11px;background:transparent;pointer-events:auto}
+      #dock>button,#dock>#activity{opacity:0;transform:translateX(-6px);pointer-events:none;transition:opacity .22s ease,transform .22s ease}
+      #dock:not(.expanded):not(:has(:focus-visible))>button,#dock:not(.expanded):not(:has(:focus-visible))>#activity{opacity:0!important}
+      /* 悬停色条展开、或键盘聚焦时才恢复整块可交互，侧边菜单与卡片才有得悬停。 */
+      #dock.expanded,#dock:has(:focus-visible){pointer-events:auto}
+      #dock.expanded>button,#dock.expanded>#activity,#dock:has(:focus-visible)>button,#dock:has(:focus-visible)>#activity{opacity:1;transform:none;pointer-events:auto}
+      #dock.expanded::before,#dock:has(:focus-visible)::before{opacity:0}
+      #dock>#activity{width:32px}
+      #menu::before,#translation-menu::before,#activity::after{content:"";position:absolute;left:100%;top:0;bottom:0;width:12px}
+      #menu::before,#translation-menu::before{left:auto;right:100%}
+      #translation-menu{position:absolute;left:46px;bottom:32px;width:150px;padding:8px;box-sizing:border-box;border:1px solid var(--line);border-radius:11px;background:var(--paper);color:var(--ink);box-shadow:0 10px 30px rgba(47,124,246,.2);font:10px/1.5 system-ui,sans-serif}
+      #translation-menu[hidden]{display:none}
+      #translation-menu .translation-title{font-weight:700;margin-bottom:4px}
+      #translation-menu button{display:block;width:100%;margin-top:4px;padding:6px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);text-align:left;cursor:pointer}
+      #translation-menu button[aria-pressed="true"]{background:var(--tint);border-color:var(--primary);color:var(--primary-deep)}
+      #translation-note{margin-top:6px;color:var(--sub);font-size:9px}
+      #dock>button{display:block;box-sizing:border-box;width:32px;height:32px;padding:0;border:1px solid var(--line);background:var(--paper);color:var(--primary);font:800 9px/1.2 system-ui,"Microsoft YaHei",sans-serif;letter-spacing:1px;text-indent:1px;cursor:pointer;transition:background .15s,color .15s,transform .1s}
+      #cap-btn{border-radius:8px 8px 0 0;border-bottom:0}
+      #sum-btn{border-radius:0 0 8px 8px;border-top:0}
       #dock>button:hover{background:var(--tint)}
       #dock>button:active{transform:translateY(1px)}
       #cap-btn.on{background:var(--primary);border-color:var(--primary);color:#fff}
       #sum-btn.cancel{background:#fff1f1;border-color:#efb6b6;color:#a33b3b}
       #cap-btn.busy,#sum-btn.busy{background:var(--tint);color:var(--primary);cursor:wait;opacity:.9}
       /* 总结悬停 1 秒弹出的侧边菜单 */
-      #menu{position:absolute;left:54px;bottom:0;width:200px;box-sizing:border-box;padding:10px 11px;border:1px solid var(--line);border-radius:14px;background:var(--paper);color:var(--ink);box-shadow:0 10px 30px rgba(47,124,246,.2);opacity:0;visibility:hidden;transform:translateX(6px);transition:opacity .15s ease,transform .15s ease,visibility .15s;font:12px/1.45 system-ui,"Microsoft YaHei",sans-serif}
+      #menu{position:absolute;left:46px;bottom:0;width:142px;box-sizing:border-box;padding:7px 8px;border:1px solid var(--line);border-radius:11px;background:var(--paper);color:var(--ink);box-shadow:0 10px 30px rgba(47,124,246,.2);opacity:0;visibility:hidden;transform:translateX(6px);transition:opacity .15s ease,transform .15s ease,visibility .15s;font:10px/1.45 system-ui,"Microsoft YaHei",sans-serif}
       #menu.open{opacity:1;visibility:visible;transform:none}
-      #menu .menu-label{margin:2px 0 0;color:var(--sub);font-size:11px;font-weight:700}
-      #menu .menu-dests{display:flex;gap:4px;margin-top:5px}
-      #menu .menu-dests button{flex:1;margin:0;padding:6px 2px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);cursor:pointer;font:700 11px/1 system-ui,"Microsoft YaHei",sans-serif;transition:background .12s}
+      #menu .menu-label{margin:2px 0 0;color:var(--sub);font-size:9px;font-weight:700}
+      #menu .menu-dests{display:flex;gap:3px;margin-top:4px}
+      #menu .menu-dests button{flex:1;margin:0;padding:4px 2px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);cursor:pointer;font:700 9px/1 system-ui,"Microsoft YaHei",sans-serif;transition:background .12s}
       #menu .menu-dests button:hover{background:var(--tint)}
       #menu .menu-dests button.active{background:var(--primary);border-color:var(--primary);color:#fff}
-      #menu>button{display:block;width:100%;margin-top:6px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);cursor:pointer;font:12px/1.2 system-ui,"Microsoft YaHei",sans-serif;text-align:left;transition:background .12s}
+      #menu>button{display:block;width:100%;margin-top:4px;padding:6px 7px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink);cursor:pointer;font:10px/1.2 system-ui,"Microsoft YaHei",sans-serif;text-align:left;transition:background .12s}
       #menu>button:hover{background:var(--tint)}
       #menu>button:disabled{opacity:.45;cursor:not-allowed}
       #menu-audio.active{border-color:#9fc2f4;background:var(--tint);color:var(--primary-deep)}
       /* 顶部三个点：与下面按钮同宽、独立四角圆角，悬停弹出最新日志 */
-      #activity{position:relative;box-sizing:border-box;width:100%;height:18px;margin-bottom:4px;border:1px solid var(--line);border-radius:6px;background:var(--paper);color:var(--primary);opacity:1;visibility:visible;pointer-events:auto}
+      #activity{position:relative;box-sizing:border-box;width:100%;height:13px;margin-bottom:3px;border:1px solid var(--line);border-radius:5px;background:var(--paper);color:var(--primary);opacity:1;visibility:visible;pointer-events:auto}
       #activity[data-state="busy"]{color:var(--primary-deep)}
       #activity[data-state="error"]{color:#c45b4d}
-      #activity-log{display:flex;align-items:center;justify-content:center;gap:4px;box-sizing:border-box;width:100%;height:100%;border:0;padding:0;background:transparent;color:inherit;border-radius:inherit;cursor:pointer}
-      #activity .dot{display:block;width:4px;height:4px;border-radius:50%;background:currentColor;opacity:.3;animation:bscg-dot 1.5s ease-in-out infinite;animation-play-state:paused}
+      #activity-log{display:flex;align-items:center;justify-content:center;gap:3px;box-sizing:border-box;width:100%;height:100%;border:0;padding:0;background:transparent;color:inherit;border-radius:inherit;cursor:pointer}
+      #activity .dot{display:block;width:3px;height:3px;border-radius:50%;background:currentColor;opacity:.3;animation:bscg-dot 1.5s ease-in-out infinite;animation-play-state:paused}
       #activity .dot:nth-child(2){animation-delay:.2s}#activity .dot:nth-child(3){animation-delay:.4s}
       #activity[data-state="busy"] .dot{animation-play-state:running}
-      #activity-error{display:none;font:700 11px/1 system-ui,sans-serif}
+      #activity-error{display:none;font:700 9px/1 system-ui,sans-serif}
       #activity[data-state="error"] .dot{display:none}#activity[data-state="error"] #activity-error{display:block}
       /* 悬停卡片：left 跟随长条实际占位，不再用固定偏移（固定值会因圆角/边距而看起来错位） */
-      #activity-card{position:absolute;left:calc(100% + 8px);bottom:-1px;width:290px;max-height:210px;box-sizing:border-box;padding:9px 11px;border:1px solid var(--line);border-radius:12px;background:var(--paper);color:var(--ink);box-shadow:0 10px 30px rgba(47,124,246,.2);font:11.5px/1.5 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+      #activity-card{position:absolute;left:calc(100% + 8px);bottom:-1px;width:210px;max-height:150px;box-sizing:border-box;padding:7px 9px;border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);box-shadow:0 10px 30px rgba(47,124,246,.2);font:10.5px/1.5 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
       #activity-card[hidden]{display:none}
-      #activity-card .ac-title{display:flex;justify-content:space-between;gap:8px;margin-bottom:5px;color:var(--sub);font:700 10.5px/1 system-ui,"Microsoft YaHei",sans-serif;letter-spacing:.03em}
+      #activity-card .ac-title{display:flex;justify-content:space-between;gap:7px;margin-bottom:4px;color:var(--sub);font:700 9.5px/1 system-ui,"Microsoft YaHei",sans-serif;letter-spacing:.03em}
       #activity-card .ac-hint{font-weight:600}
       #activity-card ol{margin:0;padding:0;list-style:none}
-      #activity-card li{display:flex;gap:6px;padding:2px 0;word-break:break-word}
-      #activity-card li span.at{flex:0 0 54px;color:var(--sub);font:600 10.5px/1.5 ui-monospace,Consolas,monospace}
+      #activity-card li{display:flex;gap:5px;padding:2px 0;word-break:break-word}
+      #activity-card li span.at{flex:0 0 46px;color:var(--sub);font:600 9.5px/1.5 ui-monospace,Consolas,monospace}
       #activity-card li span.tx{flex:1 1 auto;min-width:0}
       #activity-card li[data-level="warn"] span.tx{color:#9a6b1e}
       #activity-card li[data-level="error"] span.tx{color:#c45b4d}
@@ -316,8 +342,8 @@
       #seek-preview.hidden{opacity:0}
       #sp-time{display:block;font:700 10.5px/1 system-ui,sans-serif;letter-spacing:.04em;color:rgba(255,255,255,.65);margin-bottom:2px}
       #sp-text{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;white-space:normal}
-      @media(max-width:620px){#dock{width:38px}#dock>button{width:38px;height:40px}#menu{width:184px}#captions{font-size:18px}}
-      @media(prefers-reduced-motion:reduce){#menu,#captions{transition:none}#activity .dot{animation:none;opacity:.65}}
+      @media(max-width:620px){#dock{width:35px}#dock>button,#dock>#activity{width:27px}#dock>button{height:28px}#menu,#translation-menu{left:41px;width:129px}#captions{font-size:18px}}
+      @media(prefers-reduced-motion:reduce){#dock::before,#dock>button,#dock>#activity,#menu,#captions{transition:none}#activity .dot{animation:none;opacity:.65}}
     </style>
     <div id="dock">
       <div id="activity" data-state="idle" role="status" aria-label="">
@@ -327,10 +353,18 @@
           <ol id="activity-lines"></ol>
         </div>
       </div>
-      <button id="cap-btn" type="button" aria-pressed="false" title="点击生成实时字幕，再次点击关闭">字幕</button>
-      <button id="sum-btn" type="button" aria-haspopup="true" aria-expanded="false" title="点击直接总结；悬停 1 秒查看更多选项">总结</button>
+      <button id="cap-btn" type="button" aria-pressed="false" aria-haspopup="true" aria-expanded="false" title="点击开启/关闭字幕；悬停 1 秒设置当前视频翻译">字幕</button>
+      <button id="sum-btn" type="button" aria-haspopup="true" aria-expanded="false" title="点击准备总结；字幕与提示词就绪后，由你在 AI 页面确认发送">总结</button>
+      <div id="translation-menu" hidden aria-label="当前视频翻译">
+        <div class="translation-title">当前视频字幕翻译</div>
+        <button type="button" data-translation="inherit" aria-pressed="true">跟随全局设置</button>
+        <button type="button" data-translation="on" aria-pressed="false">翻译</button>
+        <button type="button" data-translation="off" aria-pressed="false">不翻译</button>
+        <button type="button" id="translation-speed">单句翻译测速</button>
+        <div id="translation-note">仅影响当前视频，不修改全局设置</div>
+      </div>
       <div id="menu" role="menu" aria-label="字幕助手选项">
-        <div class="menu-label">总结发送到</div>
+        <div class="menu-label">总结准备到</div>
         <div class="menu-dests">
           <button type="button" data-dest="chatgpt">ChatGPT</button>
           <button type="button" data-dest="aistudio">Gemini</button>
@@ -359,6 +393,8 @@
   document.documentElement.appendChild(host);
 
   const dock = root.querySelector('#dock');
+  const translationMenu = root.querySelector('#translation-menu');
+  const translationNote = root.querySelector('#translation-note');
   const capBtn = root.querySelector('#cap-btn');
   const sumBtn = root.querySelector('#sum-btn');
   const menu = root.querySelector('#menu');
@@ -452,6 +488,7 @@
   let lastCueText = '';
   let captureHoldRow = null;
   let captureHoldUntil = 0;
+  let replayUntil = 0;
   let livePreviewRow = null;
   let livePreviewRevision = 0;
   let livePreviewTypingTimer = 0;
@@ -648,6 +685,17 @@
     logUiStatus(text);
   }
 
+  function genericPageIdentity(value) {
+    const url = new URL(value || location.href);
+    url.hash = '';
+    const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
+    for (const key of [...url.searchParams.keys()]) {
+      if (transient.test(key)) url.searchParams.delete(key);
+    }
+    url.searchParams.sort();
+    return url.href;
+  }
+
   function pageIdentity() {
     try {
       const url = new URL(location.href);
@@ -664,13 +712,14 @@
         const videoId = url.searchParams.get('v') || url.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
         return `youtube:${videoId}`;
       }
-      return `url:${url.href}`;
+      return `url:${genericPageIdentity(url.href)}`;
     } catch {
       return `url:${location.href}`;
     }
   }
 
   function clearCueState() {
+    replayUntil = 0;
     stopLivePreviewTyping();
     rows.length = 0;
     lastCueText = '';
@@ -684,6 +733,8 @@
   }
 
   function resetForPageChange(nextIdentity) {
+    clearTimeout(translationHoverTimer);
+    setTranslationMenuOpen(false);
     captionActionVersion += 1;
     captionsDismissed = false;
     activityError = false;
@@ -741,18 +792,12 @@
     return { left, top: 0, right: left + width, bottom: innerHeight, width, height: innerHeight };
   }
 
-  // Fixed dock and reserved indicator slot: progress messages never measure,
-  // resize, mount or move the controls.
-  // 纵向位置：水平中轴线往下 20% 视口高度处开始（即顶部落在约 70% 高度），
-  // 整组比上下居中略偏下，而不是贴在正中。
-  const DOCK_OFFSET_BELOW_CENTER = 0.2;
+  // Fixed dock: keep the compact launcher vertically centered on the left edge.
+  // Clear the old inline bottom offset as well, so an extension hot-update cannot
+  // leave a page stuck at the previous lower-left position.
   function positionDock() {
-    const dockHeight = dock.offsetHeight || 110;
-    const left = '14px';
-    const desired = innerHeight / 2 + innerHeight * DOCK_OFFSET_BELOW_CENTER;
-    const top = `${Math.round(Math.max(24, Math.min(innerHeight - dockHeight - 24, desired)))}px`;
-    if (dock.style.left !== left) dock.style.left = left;
-    if (dock.style.top !== top) dock.style.top = top;
+    if (dock.style.top !== '50%') dock.style.top = '50%';
+    if (dock.style.bottom) dock.style.bottom = '';
   }
 
   // “自动字幕”：页面出现视频后按设置自动开始本地字幕。每个视频只询问一次；
@@ -814,6 +859,7 @@
       boundVideos.add(candidate.video);
       candidate.video.addEventListener('seeked', () => {
         if (candidate.video !== activeVideo || liveMode === 'live') return;
+        replayUntil = Math.max(0, ...rows.map(row => Number(row.to) || 0));
         captureHoldRow = null;
         captureHoldUntil = 0;
         stopLivePreviewTyping();
@@ -848,7 +894,7 @@
     const on = captionsVisible || (running && !captionsDismissed);
     capBtn.classList.toggle('on', on);
     capBtn.setAttribute('aria-pressed', String(on));
-    capBtn.title = on ? '关闭字幕' : '显示字幕';
+    capBtn.title = `${on ? '关闭字幕' : '显示字幕'}；悬停 1 秒设置当前视频翻译`;
   }
 
   function updateActivity() {
@@ -875,7 +921,7 @@
     sumBtn.textContent = summaryTaskId ? '取消' : '总结';
     sumBtn.classList.toggle('cancel', Boolean(summaryTaskId));
     sumBtn.setAttribute('aria-pressed', String(Boolean(summaryTaskId)));
-    sumBtn.title = summaryTaskId ? '取消当前任务' : '点击总结；悬停查看更多选项';
+    sumBtn.title = summaryTaskId ? '取消当前任务' : '点击准备总结；最终发送由你在 AI 页面确认';
     updateActivity();
   }
 
@@ -963,10 +1009,10 @@
 
   function renderCurrentCue() {
     const currentTime = Math.max(0, Number(activeVideo?.currentTime) || 0);
-    const timeline = liveMode === 'live' ? null : [...rows].reverse().find((row) => row.from <= currentTime + 0.18 && row.to >= currentTime - 0.12) || null;
+    const timeline = liveMode === 'live' ? null : rows.findLast((row) => row.from <= currentTime && row.to > currentTime) || null;
     const realtime = ['capture', 'live'].includes(liveMode);
     const displayRows = captionDisplayRows(timeline, realtime ? captureHoldRow : null,
-      captureHoldUntil, realtime ? livePreviewRow : null, performance.now());
+      captureHoldUntil, realtime ? livePreviewRow : null, performance.now(), liveMode === 'live' ? Infinity : currentTime, replayUntil);
     const renderKey = JSON.stringify(displayRows.map((row) => [row.provisional, row.content, row.sourceContent || '']));
     if (renderKey === lastCueText) return;
     lastCueText = renderKey;
@@ -1154,6 +1200,7 @@
         content: String(row.content)
       };
       if (row.sourceContent) normalized.sourceContent = String(row.sourceContent);
+      if (row.originalContent) normalized.originalContent = String(row.originalContent);
       const existingIndex = rows.findIndex((item) => Math.abs(Number(item.from) - normalized.from) < 0.05);
       if (existingIndex >= 0) rows[existingIndex] = normalized; else rows.push(normalized);
     }
@@ -1164,6 +1211,7 @@
 
   function resetForSession(sessionId, preserveRows = false) {
     if (!sessionId || sessionId === currentSessionId) return;
+    replayUntil = 0;
     currentSessionId = sessionId;
     if (!preserveRows) clearCueState();
   }
@@ -1356,7 +1404,7 @@
           return;
         }
       }
-      showFeedback(`已发送 ${response.rows} 段`, 3000);
+      showFeedback(`已在 ${label} 准备 ${response.rows} 段字幕；请检查后手动发送`, 4200);
       summaryRequestId = '';
     } catch (error) {
       if (summaryCancelRequested) showFeedback('总结任务已取消', 2600);
@@ -1435,8 +1483,107 @@
   capBtn.addEventListener('click', () => { void toggleCaptions(); });
   sumBtn.addEventListener('click', () => { void handleSummaryClick(); });
 
+  // Fixed hit area includes the left margin and child menus. Fade the contents,
+  // never move the hovered element out from under the pointer.
+  let dockHideTimer = null;
+  let translationHoverTimer = null;
+  let translationHideTimer = null;
+  dock.addEventListener('pointerenter', () => {
+    clearTimeout(dockHideTimer);
+    dock.classList.add('expanded');
+  });
+  dock.addEventListener('pointerleave', () => {
+    clearTimeout(dockHideTimer);
+    dockHideTimer = setTimeout(() => {
+      if (dock.matches(':hover') || dock.matches(':has(:focus-visible)')) return;
+      dock.classList.remove('expanded');
+      setTranslationMenuOpen(false);
+      setMenuOpen(false);
+    }, 350);
+  });
+
+  function setTranslationMenuOpen(open) {
+    clearTimeout(translationHideTimer);
+    translationMenu.hidden = !open;
+    capBtn.setAttribute('aria-expanded', String(open));
+    if (open) {
+      clearTimeout(dockHideTimer);
+      dock.classList.add('expanded');
+      setMenuOpen(false);
+      void refreshTranslationPreference();
+    }
+  }
+
+  function renderTranslationPreference(response) {
+    for (const button of translationMenu.querySelectorAll('[data-translation]')) {
+      button.setAttribute('aria-pressed', String(button.dataset.translation === response.choice));
+    }
+    translationNote.textContent = response.enabled && !response.ready
+      ? `${response.reason}；请在完整设置中配置翻译模型`
+      : `当前${response.enabled ? '翻译' : '不翻译'} · ${response.sourceLanguage || 'auto'} → ${response.targetLanguage || '未指定'} · ${response.translationMode || ''} · 仅影响此视频`;
+  }
+
+  async function refreshTranslationPreference() {
+    const identity = currentPageIdentity;
+    try {
+      const response = await sendRuntime({ type: 'BSCG_VIDEO_TRANSLATION_GET', pageUrl: location.href });
+      if (identity !== currentPageIdentity || !response?.ok) return;
+      renderTranslationPreference(response);
+    } catch (error) { translationNote.textContent = error?.message || '读取翻译设置失败'; }
+  }
+
+  function scheduleTranslationMenu() {
+    clearTimeout(translationHideTimer);
+    clearTimeout(translationHoverTimer);
+    translationHoverTimer = setTimeout(() => setTranslationMenuOpen(true), 1000);
+  }
+  capBtn.addEventListener('pointerenter', scheduleTranslationMenu);
+  capBtn.addEventListener('focus', scheduleTranslationMenu);
+  capBtn.addEventListener('pointerleave', (event) => {
+    clearTimeout(translationHoverTimer);
+    // The menu belongs to the dock. Its shared leave timer allows crossing the
+    // gap or moving slowly through the menu without racing a button timer.
+    if (event.relatedTarget && dock.contains(event.relatedTarget)) clearTimeout(dockHideTimer);
+  });
+  capBtn.addEventListener('blur', () => clearTimeout(translationHoverTimer));
+  translationMenu.addEventListener('pointerenter', () => {
+    clearTimeout(translationHideTimer);
+    clearTimeout(dockHideTimer);
+  });
+  for (const button of translationMenu.querySelectorAll('[data-translation]')) {
+    button.addEventListener('click', async () => {
+      const identity = currentPageIdentity;
+      const buttons = [...translationMenu.querySelectorAll('[data-translation]')];
+      buttons.forEach(item => { item.disabled = true; });
+      try {
+        const response = await sendRuntime({ type: 'BSCG_VIDEO_TRANSLATION_SET', pageUrl: location.href,
+          choice: button.dataset.translation, captionsVisible, segments: rows });
+        if (identity !== currentPageIdentity) return;
+        if (!response?.ok) throw new Error(response?.error || '设置当前视频翻译失败');
+        renderTranslationPreference(response);
+        showFeedback(response.enabled && !response.ready ? response.reason
+          : `当前视频已${response.enabled ? '开启' : '关闭'}翻译；全局设置未修改`, 3500);
+      } catch (error) { showFeedback(error?.message || String(error), 5000, true); }
+      finally { buttons.forEach(item => { item.disabled = false; }); }
+    });
+  }
+
+  root.querySelector('#translation-speed').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    translationNote.textContent = '正在预热并逐句测速；请先停止字幕和总结任务…';
+    try {
+      const response = await sendRuntime({ type: 'BSCG_TRANSLATE_BENCHMARK' });
+      if (!response?.ok) throw new Error(response?.error || '测速失败');
+      const r = response.report;
+      translationNote.textContent = `单句中位数 ${Math.round(r.medianMs)} ms · P95 ${Math.round(r.p95Ms)} ms；100 ms 仅供参考，不自动关闭翻译`;
+    } catch (error) { translationNote.textContent = error?.message || '测速失败'; }
+    finally { button.disabled = false; }
+  });
+
   // 总结按钮悬停 1 秒弹出侧边菜单；移开后自动收起。
   function setMenuOpen(value) {
+    if (value) setTranslationMenuOpen(false);
     menu.classList.toggle('open', value);
     sumBtn.setAttribute('aria-expanded', String(value));
   }
@@ -1453,9 +1600,11 @@
     menuTimer = setTimeout(() => { if (!sumBtn.matches(':hover')) setMenuOpen(false); }, 260);
   });
   document.addEventListener('pointerdown', (event) => {
+    if (!event.composedPath().includes(host)) setTranslationMenuOpen(false);
     if (menu.classList.contains('open') && !event.composedPath().includes(host)) setMenuOpen(false);
   }, { capture: true });
   document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') setTranslationMenuOpen(false);
     if (event.key === 'Escape' && menu.classList.contains('open')) {
       sumBtn.focus();
       setMenuOpen(false);
@@ -1472,7 +1621,7 @@
     try {
       void chrome.storage.local.set({ defaultDestination: currentDestination }).catch(() => {});
     } catch {}
-    showFeedback(`发送到 ${DESTINATIONS[currentDestination]?.label || currentDestination}`, 2200);
+    showFeedback(`总结目标：${DESTINATIONS[currentDestination]?.label || currentDestination}`, 2200);
   }));
 
   menuGenFile.addEventListener('click', () => { void generateSubtitleFile(); });
@@ -1738,6 +1887,8 @@
         from: Math.max(0, Number(message.segment.from) || 0),
         to: Math.max(Number(message.segment.from) || 0, Number(message.segment.to) || Number(message.segment.from) || 0),
         content: String(message.segment.content),
+        singleLine: Boolean(message.segment.singleLine),
+        sourceContent: String(message.segment.sourceContent || ''),
         stableContent: String(message.segment.stableContent || '')
       };
       livePreviewRevision = revision;
@@ -1810,6 +1961,7 @@
     if (typeof response.captionVisibility === 'boolean') captionsDismissed = !response.captionVisibility;
     if (!response.running && rows.length && liveMode !== 'live') liveMode = 'file';
     livePreviewRow = response?.previewSegment?.content ? { ...response.previewSegment } : null;
+    captureHoldRow = response?.finalSegment?.content ? { ...response.finalSegment } : null;
     livePreviewRevision = Math.max(0, Number(response?.previewSegment?.revision) || 0);
     renderCurrentCue();
     setRunning(Boolean(response?.running));
@@ -1828,11 +1980,13 @@
     if (!extensionAlive()) return; // 上下文失效后停止轮询，避免刷错误日志
     checkPageIdentity(); positionCaptions();
   }, 800);
-  setInterval(() => {
+  function renderCaptionFrame() {
     if (!extensionAlive()) return;
     renderCurrentCue();
     reportVideoPosition(activeVideo);
-  }, 300);
+    requestAnimationFrame(renderCaptionFrame);
+  }
+  requestAnimationFrame(renderCaptionFrame);
   refreshExportState();
 
   // ================= iframe 视频代理 =================
@@ -1868,6 +2022,7 @@
     let lastCueText = '';
     let holdRow = null;
     let holdUntil = 0;
+    let replayUntil = 0;
     let previewRow = null;
     let previewRevision = 0;
     let previewTypingTimer = 0;
@@ -1975,8 +2130,10 @@
       captionsEl.style.top = `${Math.max(rect.top + 30, rect.bottom - Math.max(96, rect.height * 0.18))}px`;
       captionsEl.style.fontSize = `${Math.round(Math.max(16, Math.min(30, rect.width * 0.026)))}px`;
       const currentTime = Math.max(0, Number(video.currentTime) || 0);
-      const timeline = frameMode === 'live' ? null : [...rows].reverse().find((row) => row.from <= currentTime + 0.18 && row.to >= currentTime - 0.12) || null;
-      const displayRows = captionDisplayRows(timeline, holdRow, holdUntil, previewRow, performance.now());
+      const timeline = frameMode === 'live' ? null : rows.findLast((row) => row.from <= currentTime && row.to > currentTime) || null;
+      const realtime = ['capture', 'live'].includes(frameMode);
+      const displayRows = captionDisplayRows(timeline, realtime ? holdRow : null, holdUntil,
+        realtime ? previewRow : null, performance.now(), frameMode === 'live' ? Infinity : currentTime, replayUntil);
       const renderKey = JSON.stringify(displayRows.map((row) => [row.provisional, row.content, row.sourceContent || '']));
       if (renderKey === lastCueText) return;
       lastCueText = renderKey;
@@ -2001,6 +2158,7 @@
         boundMedia.add(found);
         found.addEventListener('seeked', () => {
           if (video !== found || frameMode === 'live') return;
+          replayUntil = Math.max(0, ...rows.map(row => Number(row.to) || 0));
           holdRow = null;
           holdUntil = 0;
           previewRow = null;
@@ -2035,6 +2193,7 @@
             content: String(row.content || '')
           })).filter((row) => row.content);
           previewRow = response.previewSegment?.content ? { ...response.previewSegment } : null;
+          holdRow = response.finalSegment?.content ? { ...response.finalSegment } : null;
           previewRevision = Math.max(0, Number(response.previewSegment?.revision) || 0);
           setFrameCaptionVisibility(!(topOwnsOverlay || captionsDismissed || response.stopping || (!running && response.captionVisibility !== true)));
           renderCue();
@@ -2070,6 +2229,7 @@
         frameMode = running ? message.mode || 'capture' : 'file';
         topOwnsOverlay = Boolean(message.overlayOnTop);
         rows = [];
+        replayUntil = 0;
         holdRow = null;
         previewRow = null;
         previewRevision = 0;
@@ -2122,6 +2282,8 @@
           from: Math.max(0, Number(message.segment.from) || 0),
           to: Math.max(Number(message.segment.from) || 0, Number(message.segment.to) || Number(message.segment.from) || 0),
           content: String(message.segment.content),
+          singleLine: Boolean(message.segment.singleLine),
+          sourceContent: String(message.segment.sourceContent || ''),
           stableContent: String(message.segment.stableContent || '')
         };
         previewRevision = revision;
@@ -2278,10 +2440,12 @@
       if (contextInvalid || typeof chrome === 'undefined' || !chrome.runtime?.sendMessage) return;
       scan();
     }, 1000);
-    setInterval(() => {
-      if (!video || !running) return;
-      renderCue();
-    }, 400);
+    function renderFrame() {
+      if (contextInvalid) return;
+      if (video && frameCaptionsVisible) renderCue();
+      requestAnimationFrame(renderFrame);
+    }
+    requestAnimationFrame(renderFrame);
   }
 
   // ================= 页面内音频捕获（浏览器引擎一键启动）=================

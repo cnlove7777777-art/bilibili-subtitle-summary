@@ -1,4 +1,4 @@
-importScripts('media-discovery.js', 'feedback-shared.js', 'translate.js');
+importScripts('media-discovery.js', 'feedback-shared.js', 'translate.js', 'translate-onnx-models.js', 'translate-performance.js');
 // translate.js 把自己封在 IIFE 里、只对外挂一个 BSCG_TRANSLATE，这里显式取出要用的
 // 函数，避免下面直接裸调用时 ReferenceError。
 const {
@@ -6,8 +6,37 @@ const {
   translateIsReady,
   translateUnavailableReason,
   translateLines,
+  parseTranslatedLines,
   listTranslateModels
 } = BSCG_TRANSLATE;
+
+async function translateWithConfiguredModel(config, lines) {
+  try {
+    if (config.abortSignal?.aborted) throw new Error('翻译已取消');
+    if (config.mode !== 'onnx') {
+      const result = await translateLines(config, lines, config.abortSignal || null);
+      if (result.ok) BSCG_TRANSLATION_PERFORMANCE.validate(config, result.texts, lines.length);
+      return result;
+    }
+    const response = await sendToOffscreen({
+      type: 'BILI_ASR_TRANSLATE_ONNX', model: config.model,
+      sourceLanguage: config.sourceLanguage, targetLanguage: config.targetLanguage, lines,
+      realtime: Boolean(config.realtime), qualityRetry: Boolean(config.qualityRetry)
+    });
+    if (config.abortSignal?.aborted) throw new Error('翻译已取消');
+    if (!response?.ok) throw new Error(response?.error || 'ONNX 翻译失败');
+    const texts = Array.isArray(response.texts) ? response.texts
+      : parseTranslatedLines(response.content, lines.length);
+    if (texts && (texts.length !== lines.length || !texts.every((text) => typeof text === 'string'))) {
+      throw new Error(`ONNX 翻译结果数量或类型无效（期望 ${lines.length} 条）`);
+    }
+    if (!texts) throw new Error(`ONNX 翻译行数不匹配（期望 ${lines.length} 行）`);
+    BSCG_TRANSLATION_PERFORMANCE.validate(config, texts, lines.length);
+    return { ok: true, texts };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
 
 const BG_VERSION = chrome.runtime.getManifest().version;
 const JOB_TTL_MS = 60 * 60 * 1000;
@@ -16,7 +45,9 @@ const RESULT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // 5：结果必须记录媒体时长（mediaDuration），复用时与当前分P 权威时长比对。
 // 6：字幕必须覆盖整支视频（拒绝"只有开头几十秒/几乎全是音乐标注"的平台字幕），
 //    并记录字幕覆盖度；5 及更早的缓存可能是那种不可用字幕，统一作废并重新识别。
-const RESULT_SCHEMA_VERSION = 6;
+// 7：整句音频时间轴与译文身份；旧的按字数分配时间缓存需要重新生成。
+// 8: calibrated CTC sentence ranges; old whole-window rows cannot be realigned.
+const RESULT_SCHEMA_VERSION = 8;
 const JOB_CLEANUP_ALARM = 'bscg-job-cleanup';
 const OFFSCREEN_IDLE_ALARM = 'bscg-offscreen-idle';
 const ASR_REQUEST_TIMEOUT_MS = 4 * 60 * 60 * 1000;
@@ -29,6 +60,7 @@ const SENSEVOICE_LIVE_WINDOW_SECONDS = 11.5;
 const LIVE_CAPTION_MAX_CHARACTERS = 18;
 const MAX_CONCURRENT_TASKS = 3;
 function ensureTaskSlot() {
+  if (translationBenchmarkRunning) throw new Error('单句翻译测速正在运行，请等待完成后再开始识别');
   if (liveCaptures.size + activeTranscriptions.size >= MAX_CONCURRENT_TASKS) {
     throw new Error(`本地任务并发已达上限（${MAX_CONCURRENT_TASKS} 个），请等待其中一个完成后再试`);
   }
@@ -64,6 +96,8 @@ const browserRequestQueue = [];
 let activeBrowserRequest = null;
 let browserQueueDraining = false;
 let activeBenchmarkId = '';
+let translationBenchmarkRunning = false;
+let liveTranslationRefreshRevision = 0;
 let activeModelDownloadId = '';
 let browserSettingsRestartPending = false;
 let browserSettingsRestartInFlight = false;
@@ -73,6 +107,11 @@ const observedMediaByTab = new Map();
 const documentByTab = new Map();
 const bilibiliHeaderRuleBySession = new Map();
 const BILIBILI_DNR_RULE_BASE = 1800000000;
+const MEDIA_DNR_RULE_BASE = 1900000000;
+const mediaHeaderLeases = new Map();
+let mediaHeaderNextId = MEDIA_DNR_RULE_BASE;
+let mediaHeaderQueue = Promise.resolve();
+let mediaHeaderInitialized = false;
 let creatingOffscreenDocument = null;
 let offscreenCloseTimer = null;
 let liveStartChain = Promise.resolve();
@@ -216,35 +255,103 @@ function buildMediaKey({ platform = '', pageUrl = '', videoId = '', partId = '',
   return `${site}:${stableId}`;
 }
 
+// Only an active direct session can lease a rule. Each rule matches one exact
+// resource URL and this extension's requests; page traffic is never rewritten.
+function mediaRequestHeaderRule(ruleId, resourceUrl, referer) {
+  const resource = new URL(resourceUrl);
+  const page = new URL(referer);
+  if (!/^https?:$/.test(resource.protocol) || !/^https?:$/.test(page.protocol) ||
+      resource.username || resource.password || page.username || page.password) throw new Error('媒体请求上下文无效');
+  resource.hash = ''; page.hash = '';
+  // Do not send a secure page path on a downgrade.
+  if (page.protocol === 'https:' && resource.protocol !== 'https:') throw new Error('拒绝降级传送媒体 Referer');
+  const regexFilter = '^' + resource.href.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$';
+  if (regexFilter.length > 1800) throw new Error('媒体 URL 超出临时规则长度限制');
+  return { id: ruleId, priority: 2,
+    action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Referer', operation: 'set', value: page.href }] },
+    condition: { regexFilter, isUrlFilterCaseSensitive: true, initiatorDomains: [chrome.runtime.id], resourceTypes: ['xmlhttprequest'] } };
+}
+
+function acquireMediaHeaderRule(sessionId, resourceUrl) {
+  const work = mediaHeaderQueue.then(async () => {
+    const session = browserEngineSessions.get(sessionId);
+    if (!session?.directReferer || session.settled || session.aborting || session.abortError) throw new Error('媒体会话已结束');
+    if (!mediaHeaderInitialized) {
+      const existing = await chrome.declarativeNetRequest.getSessionRules();
+      const stale = existing.filter(rule => rule.id >= MEDIA_DNR_RULE_BASE && rule.id < MEDIA_DNR_RULE_BASE + 1000000);
+      if (stale.length) await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: stale.map(rule => rule.id) });
+      mediaHeaderInitialized = true;
+    }
+    if (mediaHeaderLeases.size >= 64) throw new Error('并行媒体请求超过临时规则限制');
+    do {
+      mediaHeaderNextId = MEDIA_DNR_RULE_BASE + (mediaHeaderNextId - MEDIA_DNR_RULE_BASE + 1) % 1000000;
+    } while (mediaHeaderLeases.has(mediaHeaderNextId));
+    const rule = mediaRequestHeaderRule(mediaHeaderNextId, resourceUrl, session.directReferer);
+    await chrome.declarativeNetRequest.updateSessionRules({ addRules: [rule] });
+    mediaHeaderLeases.set(rule.id, sessionId);
+    if (session.settled || session.aborting || session.abortError || browserEngineSessions.get(sessionId) !== session) {
+      await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [rule.id] });
+      mediaHeaderLeases.delete(rule.id);
+      throw new Error('媒体会话已结束');
+    }
+    return { ok: true, ruleId: rule.id };
+  });
+  mediaHeaderQueue = work.catch(() => {});
+  return work;
+}
+
+function releaseMediaHeaderRules(sessionId, ruleId = 0) {
+  const work = mediaHeaderQueue.then(async () => {
+    const ids = [...mediaHeaderLeases].filter(([id, owner]) => owner === sessionId && (!ruleId || id === ruleId)).map(([id]) => id);
+    if (ids.length) await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ids });
+    for (const id of ids) mediaHeaderLeases.delete(id);
+    return { ok: true };
+  });
+  mediaHeaderQueue = work.catch(() => {});
+  return work;
+}
+
 function currentDocumentId(tabId, fallback = '') {
   const normalized = String(fallback || '');
   if (normalized && Number.isInteger(Number(tabId))) documentByTab.set(Number(tabId), normalized);
   return String(normalized || documentByTab.get(Number(tabId)) || '');
 }
 
+function responseHeader(details, name) {
+  const wanted = String(name || '').toLowerCase();
+  const entry = (details?.responseHeaders || []).find((header) => String(header?.name || '').toLowerCase() === wanted);
+  return String(entry?.value || '').trim();
+}
+
 function rememberObservedMedia(details) {
   const tabId = Number(details?.tabId);
   const rawUrl = String(details?.url || '');
   if (tabId < 0 || !/^https?:/i.test(rawUrl)) return;
+  if (Number(details.frameId) === 0 && details.documentId && currentDocumentId(tabId) &&
+      details.documentId !== currentDocumentId(tabId)) return;
+  const responseType = responseHeader(details, 'content-type').split(';')[0].trim().toLowerCase();
   const isYouTubeMedia = /(?:^|\.)googlevideo\.com\/videoplayback/i.test(rawUrl);
-  const isManifest = /\.m3u8(?:$|[?#])/i.test(rawUrl);
+  const hlsByType = /mpegurl|vnd\.apple\.mpegurl/i.test(responseType);
+  const dashByType = /dash\+xml/i.test(responseType);
+  const isManifest = /\.(?:m3u8|mpd)(?:$|[?#])/i.test(rawUrl) || hlsByType || dashByType;
   const isFragment = /\.(?:m4s|cmfa|cmfv|ts)(?:$|[?#])/i.test(rawUrl);
   const isMediaFile = /\.(?:mp4|m4a|m4v|mov|webm|mp3|aac|ogg|opus|flac|wav)(?:$|[?#])/i.test(rawUrl);
+  const mediaByType = /^(?:audio|video)\//i.test(responseType) || /^(?:application\/mp4|application\/ogg)$/i.test(responseType);
   let isBilibiliFragment = false;
   try {
     const hostname = new URL(rawUrl).hostname;
     isBilibiliFragment = isFragment && /(^|\.)(?:bilivideo|hdslb)\.com$/i.test(hostname);
   } catch {}
   const isMediaRequest = details?.type === 'media' && !isFragment;
-  if (!isYouTubeMedia && !isManifest && !isMediaFile && !isMediaRequest && !isBilibiliFragment) return;
+  if (!isYouTubeMedia && !isManifest && !isMediaFile && !isMediaRequest && !isBilibiliFragment && !mediaByType) return;
   let url = rawUrl;
   let canonicalUrl = rawUrl;
-  let mimeType = '';
+  let mimeType = responseType;
   let bitrate = 0;
   try {
     const parsed = new URL(rawUrl);
     if (isYouTubeMedia) {
-      mimeType = decodeURIComponent(parsed.searchParams.get('mime') || '');
+      mimeType = decodeURIComponent(parsed.searchParams.get('mime') || '') || mimeType;
       bitrate = Number(parsed.searchParams.get('bitrate')) || 0;
       // 用去掉瞬时 Range 参数的地址去重，但保留播放器真实发出的签名 URL 供下载。
       // 某些 GoogleVideo 签名会覆盖查询参数，改写实际请求可能直接导致 403。
@@ -253,7 +360,9 @@ function rememberObservedMedia(details) {
     }
   } catch {}
   const records = observedMediaByTab.get(tabId) || [];
-  const kind = isManifest ? 'hls' : isBilibiliFragment ? 'fragment' : 'media';
+  const kind = isManifest
+    ? (dashByType || /\.mpd(?:$|[?#])/i.test(rawUrl) ? 'dash' : 'hls')
+    : isBilibiliFragment ? 'fragment' : 'media';
   const key = `${kind}\n${canonicalUrl}`;
   const next = records.filter((entry) => entry.key !== key);
   next.push({
@@ -279,35 +388,137 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] }
 );
 
-// ---- 运行日志：环形缓冲，存 storage.session（浏览器会话内有效，最多 600 条）----
-// 过程细节全部进日志；气泡只保留用户必须看到的状态与错误。
+// URL suffixes are not enough for modern MSE players: manifests and audio can
+// be extensionless or fetched from workers. Classify the response once headers
+// are available, similar to media-sniffer extensions, without changing requests.
+chrome.webRequest.onResponseStarted.addListener(
+  rememberObservedMedia,
+  { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] },
+  ['responseHeaders']
+);
+
+// ---- 运行日志 ----
+// 【排查入口 / read-before-debugging】扩展所有运行环节都经由 pushLog 汇总到这里。
+// 设计约定（改动本区块前先读完）：
+//   1) 每条日志带自增序号 n。设置页用 n 做增量拉取（BSCG_GET_LOGS + since），
+//      因此 n 必须严格单调递增：不允许重排、回退或复用。SW 重启后会把历史条目
+//      与本次新条目合并，保留历史最大序号（见 ensureLogBuffer），保证对外单调递增。
+//   2) 存储位置由设置项 logPersist（设置 → 日志 → 开发者模式）决定：
+//      关闭 = storage.session（内存，浏览器重启即清，最多 LOG_BUFFER_MAX 条）；
+//      打开 = storage.local（持久，重启不丢，最多 LOG_PERSIST_MAX 条）。
+//   3) 消息前缀即链路名，是排查时的主要过滤手段：
+//      [init] [session] [browser] [browser/queue] [browser/inference]
+//      [browser/lookahead] [transport] [media/route]
+//      [translate] [translate/realtime] [translate/settings] [translate/display]
+//      [capture] [cache] [payload] [offscreen] [bilibili] [youtube]
+//   4) 只记"能据此定位问题"的事实：走了哪个分支、为什么降级、关键计数与耗时。
+//      高频逐帧信息（每个分片、每次 tick）不进日志，需要时读 metrics / 用 DEBUG 级。
+//      已有节流的三处（改动时不要去掉节流，否则长片会在十几分钟内刷满缓冲区）：
+//      [translate] 批次进度 10s、[translate/realtime] 失败 10s、
+//      [browser/lookahead] 窗口进度 20s。
+//   5) 典型症状 → 该看哪条日志（按此顺序查，能少走弯路）：
+//      · 字幕一直显示原文            → [translate/realtime] 单句翻译失败？
+//                                      否则看 [media/route] 是否降级到实时取音
+//                                      （实时取音链路没有未来音频，本来就不能提前翻译）
+//      · 字幕比声音越来越慢          → [browser/lookahead] 的"识别领先"是否持续下降，
+//                                      再看 [browser/inference] 单次推理耗时
+//      · 开着翻译却一次都没请求模型  → 有没有 [translate] 启用行（没有 = 配置未就绪）；
+//                                      有启用但无进度 = 看 [xx/direct] 是否"整轨直取失败…切换实时取音"
+//      · 播放中卡顿/字幕整段消失     → [session] 收尾原因 + [browser/queue] 排队情况
+//      · 换了视频还显示旧字幕        → [cache] 作废记录 + [session] 的媒体/文档校验记录
+//      · 拖动进度条后字幕空白        → [translate/realtime] 的"已丢弃 N 个单句"，
+//                                      其后应紧跟新的入队记录；否则队列没重建
 const LOG_BUFFER_MAX = 600;
-let logBuffer = null;
+const LOG_PERSIST_MAX = 4000;
+const LOG_STORAGE_KEY = 'bscgLogs';
+let logBuffer = [];
+let logSeq = 0;
+let logRestored = false;
+let logRestorePromise = null;
+let logWriteQueue = Promise.resolve();
+// 落盘开关：由 settings.logPersist 驱动，onChanged 里同步，决定日志写 session 还是 local。
+let logPersistEnabled = false;
 let logPersistTimer = null;
 // 页面上的进度条要能显示"最新进展"，因此日志除了进缓冲区，还要广播给标签页。
 let liveLogSink = null;
 
-function pushLog(level, message) {
-  const entry = { t: Date.now(), level: String(level || 'info'), msg: String(message).slice(0, 600) };
-  if (!logBuffer) logBuffer = [];
-  logBuffer.push(entry);
-  if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
+function logStorageArea() {
+  try { return logPersistEnabled ? chrome.storage.local : chrome.storage.session; } catch { return null; }
+}
+
+function trimLogBuffer() {
+  const max = logPersistEnabled ? LOG_PERSIST_MAX : LOG_BUFFER_MAX;
+  if (logBuffer.length > max) logBuffer.splice(0, logBuffer.length - max);
+}
+
+// 单次恢复历史并与启动早期新条目合并，避免并发读取看到尚未恢复的缓冲。
+// 恢复期间的新条目在历史最大序号之后编号；写盘与对外读取都必须先 await。
+async function ensureLogBuffer() {
+  if (logRestored) return logBuffer;
+  if (!logRestorePromise) logRestorePromise = (async () => {
+    let stored = null;
+    try {
+      const settings = await chrome.storage.local.get('logPersist');
+      logPersistEnabled = Boolean(settings.logPersist);
+      stored = (await logStorageArea()?.get(LOG_STORAGE_KEY))?.[LOG_STORAGE_KEY];
+      if (!Array.isArray(stored) || !stored.length) {
+        const other = logPersistEnabled ? chrome.storage.session : chrome.storage.local;
+        stored = (await other?.get(LOG_STORAGE_KEY))?.[LOG_STORAGE_KEY];
+      }
+    } catch {}
+    const history = Array.isArray(stored) ? stored.filter(entry => entry && entry.msg) : [];
+    const keys = new Set();
+    const merged = [];
+    let seq = 0;
+    for (const entry of [...history, ...logBuffer]) {
+      const key = JSON.stringify([entry.t, entry.level, entry.msg]);
+      if (keys.has(key)) continue;
+      keys.add(key);
+      seq = Math.max(seq + 1, Number(entry.n) || 0);
+      merged.push({ ...entry, n: seq });
+    }
+    logBuffer = merged;
+    logSeq = Math.max(logSeq, seq);
+    trimLogBuffer();
+    logRestored = true;
+    return logBuffer;
+  })();
+  return logRestorePromise;
+}
+
+function scheduleLogPersist() {
   clearTimeout(logPersistTimer);
   logPersistTimer = setTimeout(() => {
-    try { chrome.storage.session.set({ bscgLogs: logBuffer.slice(-LOG_BUFFER_MAX) }).catch(() => {}); } catch {}
+    logPersistTimer = null;
+    logWriteQueue = logWriteQueue.catch(() => {}).then(async () => {
+      await ensureLogBuffer(); // never overwrite history with startup-only rows
+      await logStorageArea()?.set({ [LOG_STORAGE_KEY]: logBuffer.slice(-(logPersistEnabled ? LOG_PERSIST_MAX : LOG_BUFFER_MAX)) });
+    }).catch(() => {});
   }, 500);
+}
+
+// 落盘开关切换时迁移存储：新区域写入当前缓冲，旧区域的键清掉，避免两份日志并存。
+async function migrateLogStorage() {
+  logWriteQueue = logWriteQueue.catch(() => {}).then(async () => {
+    await ensureLogBuffer();
+    const target = logStorageArea();
+    const stale = logPersistEnabled ? chrome.storage.session : chrome.storage.local;
+    await target?.set({ [LOG_STORAGE_KEY]: logBuffer.slice(-(logPersistEnabled ? LOG_PERSIST_MAX : LOG_BUFFER_MAX)) });
+    await stale?.remove(LOG_STORAGE_KEY); // only remove after a successful write
+  });
+  return logWriteQueue;
+}
+
+function pushLog(level, message) {
+  const entry = { n: ++logSeq, t: Date.now(), level: String(level || 'info'), msg: String(message).slice(0, 600) };
+  logBuffer.push(entry);
+  trimLogBuffer();
+  scheduleLogPersist();
   try { liveLogSink?.(entry); } catch {}
 }
 
 async function getLogs() {
-  if (logBuffer) return logBuffer;
-  try {
-    const stored = await chrome.storage.session.get('bscgLogs');
-    logBuffer = Array.isArray(stored?.bscgLogs) ? stored.bscgLogs : [];
-  } catch {
-    logBuffer = [];
-  }
-  return logBuffer;
+  return ensureLogBuffer();
 }
 
 // 广播给页面进度条：节流 200ms，只保留最新一条；串行发送避免并发打满消息通道。
@@ -351,7 +562,7 @@ async function flushLiveLog() {
 liveLogSink = publishLiveLog;
 
 const DEFAULTS = {
-  prompt: '完整总结视频字幕中的观点和内容。',  language: 'zh',
+  prompt: '完整总结视频字幕中的观点和内容。',  language: 'zh', asrLanguage: 'auto',
   asrProfile: 'sensevoice_browser',
   asrBackend: 'auto',
   gpuPreference: 'high-performance',
@@ -379,15 +590,19 @@ const DEFAULTS = {
   translateRemoteBaseUrl: 'https://api.openai.com/v1',
   translateRemoteApiKey: '',
   translateRemoteModel: '',
+  translateOnnxModel: 'qwen3-0.6b-q4f16',
   translateTargetLanguage: 'zh',
   // translated：只显示译文（默认）；bilingual：译文为主 + 原文字号更小
-  translateDisplayMode: 'translated'
+  translateDisplayMode: 'translated',
+  // 开发者模式：日志落盘。false = 只在当前浏览器会话内保留（storage.session，重启即空）；
+  // true = 写入 storage.local，浏览器重启后仍可回溯。切换时由 migrateLogStorage 迁移。
+  logPersist: false
 };
 const REMOVED_TRANSLATION_KEYS = [
   'translationApiUrl', 'translationServiceName', 'translationModel',
   'translationApiKey', 'translationTargetLanguage', 'subtitleDisplayMode',
-  // "一键发送"开关已移除：自动发送是唯一行为。
-  'autoSendSummary'
+  // 旧版的一键发送设置已废弃；当前版本不会替用户提交消息。
+  'autoSendSummary' 
 ];
 const REMOVED_NATIVE_KEYS = [
   'modelDir', 'autoDownloadModel', 'nativeEngineId', 'nativeProviderCuda',
@@ -396,12 +611,15 @@ const REMOVED_NATIVE_KEYS = [
 ];
 
 async function initializeExtension() {
-  // 后台每次启动都留一条版本记录：出问题时能直接从日志确认真正在跑的是哪一版。
-  pushLog('info', `[init] 后台已就绪 version=${BG_VERSION}`);
   const current = await chrome.storage.local.get([
     ...Object.keys(DEFAULTS), ...REMOVED_NATIVE_KEYS,
     'liveSettingsVersion', 'browserEngineSettingsVersion'
   ]);
+  // 落盘开关必须在写第一条日志之前确定：否则 [init] 会被写进 session，
+  // 重启后读不到，表现为"已开启落盘却每次重启都没有历史"。
+  logPersistEnabled = Boolean(current.logPersist);
+  // 后台每次启动都留一条版本记录：出问题时能直接从日志确认真正在跑的是哪一版。
+  pushLog('info', `[init] 后台已就绪 version=${BG_VERSION} 日志落盘=${logPersistEnabled ? '开' : '关'}`);
   const missing = {};
   for (const [key, value] of Object.entries(DEFAULTS)) {
     if (current[key] === undefined) missing[key] = value;
@@ -454,6 +672,18 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  if ('logPersist' in changes) {
+    // 落盘开关切换：先更新写入门控，再记一条（这条会写进新区域），最后迁移旧区域数据。
+    const next = Boolean(changes.logPersist.newValue);
+    if (next !== logPersistEnabled) {
+      logPersistEnabled = next;
+      pushLog('info', `[log] 日志落盘${next ? '已开启：写入 storage.local，浏览器重启后仍可回溯' : '已关闭：仅保留当前浏览器会话'}`);
+      void migrateLogStorage().catch(() => {});
+    }
+  }
+  if (Object.keys(changes).some(key => key === 'language' || key.startsWith('translate'))) {
+    void refreshLiveTranslationSettings().catch(error => pushLog('warn', `[translate/settings] ${error?.message || String(error)}`));
+  }
   for (const [key, change] of Object.entries(changes)) {
     if (key.startsWith('job:') && change.newValue === undefined) {
       void chrome.alarms.clear(`bscg-job-expire:${key.slice(4)}`);
@@ -499,6 +729,17 @@ chrome.commands.onCommand.addListener(async (command) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (['BILI_ASR_MEDIA_HEADERS_ACQUIRE', 'BILI_ASR_MEDIA_HEADERS_RELEASE'].includes(message?.type) && message.target === 'background') {
+    if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('offscreen.html')) {
+      sendResponse({ ok: false, error: '仅离屏音轨引擎可申请临时请求头' });
+      return false;
+    }
+    const action = message.type === 'BILI_ASR_MEDIA_HEADERS_ACQUIRE'
+      ? acquireMediaHeaderRule(String(message.sessionId || ''), String(message.url || ''))
+      : releaseMediaHeaderRules(String(message.sessionId || ''), Number(message.ruleId) || 0);
+    action.then(sendResponse).catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === 'BILI_ASR_EVENT') {
     handleBrowserEngineEvent(message);
     sendResponse({ ok: true });
@@ -594,6 +835,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  if (message?.type === 'BSCG_VIDEO_TRANSLATION_GET' || message?.type === 'BSCG_VIDEO_TRANSLATION_SET') {
+    resolveRequestedTabId(message, sender).then((tabId) => videoTranslationPreference(tabId, message))
+      .then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
   if (message?.type === 'BSCG_LIVE_START') {
     const liveMessage = { ...message, documentId: currentDocumentId(message.tabId || sender.tab?.id, sender.documentId || message.documentId) };
     resolveRequestedTabId(message, sender).then((tabId) => startLiveCapture(tabId, Boolean(message.ignoreCache), liveMessage)).then(sendResponse).catch((error) => {
@@ -609,7 +855,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'BSCG_CAPTIONS_SHOW') {
-    resolveRequestedTabId(message, sender).then((tabId) => setCaptionDisplay(tabId, true, message))
+    resolveRequestedTabId(message, sender).then((tabId) => showRetainedCaptions(tabId, message))
       .then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
@@ -646,6 +892,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // 翻译队列据此判断压着的行是否还领先播放头；被追平（快进/回拖）就立刻
       // 落地识别原文，不让用户面对空字幕。
       session.translator?.tick?.();
+      const translationProgress = session.translator?.stats?.();
       if (session.mode === 'capture') rememberCaptureClock(session, message);
       if (session.backend === 'browser') {
         void sendToOffscreen({
@@ -656,7 +903,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           duration: Number(message.duration) || 0,
           playbackRate: session.playbackRate,
           preservesPitch: message.preservesPitch,
-          paused: session.paused
+          paused: session.paused,
+          translatedThrough: translationProgress?.translatedContiguousTo,
+          translationLatencyP95Ms: translationProgress?.latencyP95Ms
         }).catch(() => {});
       }
     }
@@ -808,7 +1057,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   if (message?.type === 'BSCG_GET_LOGS') {
-    getLogs().then((logs) => sendResponse({ ok: true, logs })).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    // 设置页自动刷新协议：since > 0 时只回传序号更大的新条目。
+    // truncated 为真说明 since 太旧、对应条目已被环形缓冲挤掉，设置页必须整体重载
+    // 而不是继续增量追加，否则会丢中间一段日志。
+    const since = Math.max(0, Number(message.since) || 0);
+    getLogs().then((logs) => {
+      const last = logs.length ? Number(logs[logs.length - 1].n) || 0 : 0;
+      const first = logs.length ? Number(logs[0].n) || 0 : 0;
+      sendResponse({
+        ok: true,
+        logs: since > 0 ? logs.filter((entry) => (Number(entry.n) || 0) > since) : logs,
+        seq: last,
+        total: logs.length,
+        truncated: since > 0 && (first > since + 1 || since > last)
+      });
+    }).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
   if (message?.type === 'BSCG_BROWSER_STATUS') {
@@ -828,7 +1091,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'BSCG_BROWSER_BENCHMARK_START') {
-    if (liveCaptures.size || activeTranscriptions.size || browserEngineSessions.size || activeBrowserRequest || browserRequestQueue.length || activeModelDownloadId) {
+    if (translationBenchmarkRunning || liveCaptures.size || activeTranscriptions.size || browserEngineSessions.size || activeBrowserRequest || browserRequestQueue.length || activeModelDownloadId) {
       sendResponse({ ok: false, error: '请先停止或取消当前字幕/总结任务' });
       return false;
     }
@@ -867,7 +1130,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'BSCG_MODEL_DOWNLOAD_START') {
-    if (liveCaptures.size || activeTranscriptions.size || browserEngineSessions.size || activeBrowserRequest || browserRequestQueue.length || activeBenchmarkId) {
+    if (translationBenchmarkRunning || liveCaptures.size || activeTranscriptions.size || browserEngineSessions.size || activeBrowserRequest || browserRequestQueue.length || activeBenchmarkId) {
       sendResponse({ ok: false, error: '请先停止或取消当前字幕、总结或测速任务' });
       return false;
     }
@@ -929,10 +1192,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message?.type === 'BSCG_CLEAR_LOGS') {
-    logBuffer = [];
-    try { chrome.storage.session.remove('bscgLogs').catch(() => {}); } catch {}
-    sendResponse({ ok: true });
-    return false;
+    // 清空两个区域：落盘开关可能刚切换过，另一侧还留着上一次的副本。
+    logWriteQueue = logWriteQueue.catch(() => {}).then(async () => {
+      await ensureLogBuffer();
+      logBuffer = []; // retain the sequence, so an old cursor never hides new rows
+      await Promise.all([chrome.storage.session.remove(LOG_STORAGE_KEY), chrome.storage.local.remove(LOG_STORAGE_KEY)]);
+    });
+    logWriteQueue.then(() => sendResponse({ ok: true })).catch(error => sendResponse({ ok: false, error: String(error) }));
+    return true;
   }
   if (message?.type === 'BSCG_CAPTURE_NOTE') {
     // 页面内捕获的看门狗提示：经后台转成气泡状态（content script 之间不能直接互发）
@@ -946,23 +1213,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
       const config = translateActiveConfig({ ...stored, ...(message.settings || {}) });
-      const models = await listTranslateModels(config);
+      const models = config.mode === 'onnx'
+        ? Object.entries(globalThis.BSCG_ONNX_TRANSLATION_MODELS).map(([id, spec]) => ({ id, label: spec.label }))
+        : await listTranslateModels(config);
       return { ok: true, models, config: { baseUrl: config.baseUrl, model: config.model, targetLanguage: config.targetLanguage } };
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
+    return true;
+  }
+  if (message?.type === 'BSCG_TRANSLATE_BENCHMARK') {
+    (async () => {
+      if (liveCaptures.size || activeBenchmarkId || activeModelDownloadId || activeTranscriptions.size || activeBrowserRequest || browserRequestQueue.length || browserEngineSessions.size) {
+        throw new Error('请先停止字幕和总结任务，再运行独立翻译测速');
+      }
+      if (translationBenchmarkRunning) throw new Error('翻译测速正在运行');
+      translationBenchmarkRunning = true;
+      try {
+        const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
+        const config = translateActiveConfig({ ...stored, ...(message.settings || {}), translateEnabled: true });
+        if (!translateIsReady(config)) throw new Error(translateUnavailableReason(config));
+        const report = await BSCG_TRANSLATION_PERFORMANCE.measure(config, translateWithConfiguredModel);
+        await chrome.storage.session.set({ [`translationPerformance:${report.fingerprint}`]: report });
+        pushLog('info', `[translate/benchmark] 单句 P95=${Math.round(report.p95Ms)}ms ` +
+          `100ms参考=${report.meets100msTarget ? '达到' : '未达到'} 不自动关闭翻译`);
+        return { ok: true, report };
+      } finally { translationBenchmarkRunning = false; }
+    })().then(sendResponse).catch(error => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
   if (message?.type === 'BSCG_TRANSLATE_TEST') {
     // 设置页试译：真实打一发请求，确认端点/Key/模型/目标语言整条链路。
     (async () => {
+      if (translationBenchmarkRunning) throw new Error('请等待单句翻译测速完成');
       const stored = await chrome.storage.local.get(Object.keys(DEFAULTS));
       const config = translateActiveConfig({ ...stored, ...(message.settings || {}) });
       if (!translateIsReady(config)) throw new Error(translateUnavailableReason(config) || '翻译未配置');
       // 原文一并回给设置页，避免试译文案在两处各写一份后漂移。
-      const sources = [
-        'Hello everyone, welcome back to the channel.',
-        'Today we are going to test local subtitle translation on a laptop GPU.'
-      ];
-      const result = await translateLines(config, sources);
+      const sources = BSCG_TRANSLATION_PERFORMANCE.samplesForSource(config.sourceLanguage).slice(0, 2);
+      const result = await translateWithConfiguredModel(config, sources);
       if (!result.ok) throw new Error(result.error || '翻译请求失败');
       return { ok: true, texts: result.texts, sources, targetLanguage: config.targetLanguage, mode: config.mode, model: config.model };
     })().then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
@@ -1614,54 +1901,45 @@ async function resolveBilibiliAudioCandidates(tabId, bvid, cid, { expectedDurati
 
 async function getGenericMediaSource(tabId) {
   const results = await chrome.scripting.executeScript({
-    target: { tabId, allFrames: true },
-    world: 'MAIN',
-    injectImmediately: true,
-    func: () => {
-      const videos = [...document.querySelectorAll('video')].map((video) => {
-        const rect = video.getBoundingClientRect();
-        const style = getComputedStyle(video);
-        const visibleWidth = Math.max(0, Math.min(rect.right, innerWidth) - Math.max(rect.left, 0));
-        const visibleHeight = Math.max(0, Math.min(rect.bottom, innerHeight) - Math.max(rect.top, 0));
-        const hidden = style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) <= 0.05 || video.getAttribute('aria-hidden') === 'true';
-        const area = visibleWidth * visibleHeight;
-        const duration = Number.isFinite(video.duration) ? Number(video.duration) : 0;
-        const playing = !video.paused && !video.ended && video.readyState >= 2;
-        const score = (duration >= 120 ? 1e12 : duration >= 45 ? 4e11 : 0) + (playing ? 3e11 : 0) + area * 1000;
-        return { video, area, duration, playing, hidden, score };
-      }).filter((item) => !item.hidden && item.area >= 120 * 120)
-        .sort((a, b) => b.score - a.score);
-      const primary = videos[0];
-      if (!primary) return null;
-      const direct = [primary.video.currentSrc, primary.video.src]
-        .find((value) => /^(https?|file):/i.test(String(value || ''))) || '';
-      const observedRecords = Array.isArray(window.__BROWSER_SENSEVOICE_MEDIA_URLS__)
-        ? window.__BROWSER_SENSEVOICE_MEDIA_URLS__ : [];
-      const observed = observedRecords
-        .filter((entry) => ['hls', 'media'].includes(String(entry?.kind || 'media')))
-        .map((entry) => String(entry?.url || ''));
-      const resources = [...new Set([...performance.getEntriesByType('resource').map((entry) => String(entry.name || '')), ...observed])]
-        .filter((value) => /^(https?|file):/i.test(value));
-      const manifest = [...resources].reverse().find((value) => /\.m3u8(?:$|[?#])/i.test(value)) || '';
-      const dashManifest = [...performance.getEntriesByType('resource').map((entry) => String(entry.name || '')), ...observedRecords.filter((entry) => entry?.kind === 'dash').map((entry) => String(entry.url || ''))]
-        .reverse().find((value) => /\.mpd(?:$|[?#])/i.test(value)) || '';
-      const mediaFile = [...resources].reverse().find((value) => /\.(?:mp4|m4a|m4v|mov|webm|mp3|aac|ogg|opus|flac|wav)(?:$|[?#])/i.test(value)) || '';
-      const mediaUrl = manifest || direct || mediaFile;
-      if (!mediaUrl) return null;
-      return {
-        mediaUrl,
-        manifest: Boolean(manifest),
-        dashManifest,
-        referer: location.href,
-        title: document.title || '',
-        duration: primary.duration,
-        playing: primary.playing,
-        score: primary.score + (manifest ? 1e8 : direct ? 5e7 : 0)
-      };
-    }
+    target: { tabId, allFrames: true }, world: 'MAIN', injectImmediately: true,
+    func: bscgFindMedia, args: ['source']
   });
-  return results.map((item) => item.result ? { ...item.result, frameId: Number(item.frameId) || 0 } : null).filter((item) => item?.mediaUrl)
+  return results.map(item => item.result ? { ...item.result, frameId: Number(item.frameId) || 0 } : null)
+    // Keep the frame that owns the active media even when its currentSrc is
+    // blob:/MediaSource. webRequest may know the real HLS/DASH/audio URL.
+    .filter(item => item && (item.mediaUrl || item.mediaSrc || Number(item.score) > 0))
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] || null;
+}
+
+function genericReplayCandidates(generic, observed = []) {
+  if (!generic) return [];
+  const candidates = [];
+  const frameId = Math.max(0, Number(generic.frameId) || 0);
+  const add = entry => {
+    if (!/^https?:/i.test(entry.url || '') || candidates.some(candidate => candidate.url === entry.url)) return;
+    candidates.push({ url: entry.url, kind: entry.kind === 'dash' ? 'dash-manifest' : entry.kind === 'hls' ? 'hls' : 'file',
+      frameId, mimeType: entry.mimeType || '', bitrate: Number(entry.bitrate) || 0 });
+  };
+  if (generic.mediaUrl) add({ url: generic.mediaUrl, kind: generic.kind || (generic.manifest ? 'hls' : 'media') });
+  for (const entry of generic.candidates || []) add(entry);
+  const blobBacked = /^blob:/i.test(generic.mediaSrc || '');
+  const noReadableSource = !generic.mediaUrl;
+  for (const entry of observed) {
+    if (Number(entry.frameId) !== frameId) continue;
+    const mime = String(entry.mimeType || '');
+    // Network sniffing is intentionally bounded to the frame that owns the
+    // active media element. Extensionless HLS/DASH and audio are always useful.
+    // For blob/MSE players (or when currentSrc yielded no readable URL), also
+    // admit muxed MP4/WebM as a last-resort candidate; the engine range-probes
+    // the container before accepting it, so an unrelated preload normally dies
+    // here instead of being treated as the current video's audio.
+    const likelyMuxed = entry.kind === 'media' &&
+      /^(?:video\/(?:mp4|webm)|application\/mp4)$/i.test(mime);
+    const safeObserved = ['hls', 'dash'].includes(entry.kind) || /^audio\//i.test(mime) ||
+      (entry.kind === 'media' && blobBacked) || (noReadableSource && likelyMuxed);
+    if (safeObserved) add(entry);
+  }
+  return candidates;
 }
 
 function completeYouTubeAudioUrl(value) {
@@ -1724,7 +2002,13 @@ async function getYouTubePlayerState(tabId, expectedVideoId) {
             url: format.url,
             bitrate: Number(format.bitrate) || 0,
             mimeType: format.mimeType || ''
-          })).sort((a, b) => b.bitrate - a.bitrate)
+          })).sort((a, b) => b.bitrate - a.bitrate),
+          muxedFormats: (response?.streamingData?.formats || [])
+            .filter(format => format.url && /^video\/mp4/i.test(format.mimeType || '') &&
+              /mp4a/i.test(format.mimeType || ''))
+            .map(format => ({ url: format.url, mimeType: format.mimeType, bitrate: Number(format.bitrate) || 0,
+              height: Number(format.height) || 0, itag: Number(format.itag) || 0 }))
+            .sort((a, b) => a.height - b.height || a.bitrate - b.bitrate)
         };
       };
       let state = read();
@@ -1769,6 +2053,21 @@ async function getYouTubePlayerState(tabId, expectedVideoId) {
     })
     .sort((a, b) => Number(/audio\/mp4/i.test(b.mimeType || '')) - Number(/audio\/mp4/i.test(a.mimeType || '')) || Math.abs(Number(a.bitrate) - 128000) - Math.abs(Number(b.bitrate) - 128000));
   return state;
+}
+
+function youTubeReplayCandidates(state) {
+  const audio = (state.audioFormats || []).filter(format => format.url).map(format => ({
+    ...format, url: completeYouTubeAudioUrl(format.url), kind: 'file', frameId: 0,
+    videoId: format.source === 'webRequest' ? '' : state.responseVideoId,
+    identityConfidence: format.source === 'webRequest' ? 'observed-in-tab' : 'player-response',
+    source: format.source || 'youtube-audio'
+  }));
+  const muxed = (state.muxedFormats || []).filter(format => format.url &&
+    /^video\/mp4/i.test(format.mimeType || '') && /mp4a/i.test(format.mimeType || ''))
+    .sort((a, b) => Number(a.height) - Number(b.height) || Number(a.bitrate) - Number(b.bitrate))
+    .map(format => ({ ...format, url: completeYouTubeAudioUrl(format.url), kind: 'muxed-video',
+      hasAudio: true, frameId: 0, videoId: state.responseVideoId, source: 'youtube-muxed' }));
+  return audio.concat(muxed);
 }
 
 function selectYouTubeCaption(tracks, language) {
@@ -1842,6 +2141,7 @@ function localEngineLabel(settings, realtime = false) {
 function finishBrowserEngineSession(session, error = null) {
   if (!session || session.settled) return;
   session.settled = true;
+  void releaseMediaHeaderRules(session.sessionId).catch(error => pushLog('warn', `[media/hls] 临时请求头清理失败：${error?.message || error}`));
   clearTimeout(session.timeout);
   clearTimeout(session.abortTimer);
   if (Number.isInteger(session.scanFrameId)) {
@@ -1950,6 +2250,21 @@ function abortBrowserEngineSession(session, reason) {
 function handleBrowserEngineEvent(message) {
   const session = browserEngineSessions.get(String(message?.sessionId || ''));
   if (!session || session.settled) return;
+  // A cancelled session still owns its stop acknowledgement even after navigation.
+  // Reject its captions below, but release ownership before checking page identity.
+  if (session.aborting && ['stopped', 'error'].includes(message.event)) {
+    pushLog('info', `[browser/stop] 收到取消完成确认 event=${message.event} session=${session.sessionId}`);
+    finishBrowserEngineSession(session, session.abortError || browserTaskCancelledError('识别已取消'));
+    return;
+  }
+  if (message.sourceMode === 'direct' && Number(message.directGeneration || 0) < Number(session.directGeneration || 0)) {
+    // A terminal event means this engine session has ended even if seek raced
+    // its last message. Settle ownership without publishing obsolete rows.
+    if (message.event === 'stopped') finishBrowserEngineSession(session, session.abortError || null);
+    else if (message.event === 'error') finishBrowserEngineSession(session,
+      browserEngineError(message.error || '浏览器 ASR 已结束', message.errorCode || 'DIRECT_AUDIO_FAILED'));
+    return;
+  }
   if ((message.mediaKey && session.mediaKey && message.mediaKey !== session.mediaKey) ||
       (session.documentId && currentDocumentId(session.tabId) && session.documentId !== currentDocumentId(session.tabId))) {
     session.abort('媒体或页面文档已经变化，已丢弃旧 ASR 结果');
@@ -1974,7 +2289,7 @@ function handleBrowserEngineEvent(message) {
     const key = `${row.from.toFixed(3)}\n${row.to.toFixed(3)}\n${row.content}`;
     if (session.seenSegments.has(key)) continue;
     session.seenSegments.add(key);
-    session.onProgress?.({ type: 'segment', segment: row });
+    session.onProgress?.({ type: 'segment', segment: row, metrics: message.metrics || {} });
   }
   session.segments = nextRows;
   if (message.finalSegment?.content && message.finalSegment.id !== session.lastFinalPhraseId) {
@@ -2000,6 +2315,7 @@ function handleBrowserEngineEvent(message) {
     });
   }
   session.metrics = message.metrics || session.metrics;
+  if (message.sourceMode === 'direct') session.onProgress?.({ type: 'metrics', metrics: session.metrics });
   if ((message.event === 'pause-for-model' || message.event === 'resume-after-model') && message.sourceMode !== 'direct') {
     const scanMayRun = !['stopping', 'stopped', 'error'].includes(message.status);
     if (session.scanMode && scanMayRun && message.event === 'resume-after-model' && !session.scanStarted) {
@@ -2011,8 +2327,6 @@ function handleBrowserEngineEvent(message) {
         type,
         sessionId: session.sessionId
       }, { frameId: session.scanFrameId }).catch(() => null);
-    } else if (!session.scanMode) {
-      session.onProgress?.({ type: 'media-control', action: message.event === 'pause-for-model' ? 'pause' : 'resume', text: message.statusText || '' });
     }
   }
   // Segment and preview messages already have dedicated UI channels. Forwarding
@@ -2021,6 +2335,26 @@ function handleBrowserEngineEvent(message) {
   if (message.statusText && message.event !== 'running' && message.statusText !== session.lastProgressText) {
     session.lastProgressText = message.statusText;
     session.onProgress?.({ type: 'progress', text: message.statusText, metrics: message.metrics || {} });
+  }
+  if (message.event === 'audio-ready') {
+    // 【提前量观测点】整轨前瞻每完成一个滚动窗口上报一次，这是回答"字幕到底能提前
+    // 多少秒"的唯一直接证据。三级进度分别对应三种瓶颈：
+    //   fetchedTo    网络已拿到手的媒体秒数 —— 卡住说明下载慢（限速 / 分片太大）
+    //   decodedTo    已解码成 PCM 的秒数   —— 卡住说明解封装/WebCodecs 慢
+    //   recognizedTo 已出字幕的秒数        —— 卡住说明 ASR 推理慢
+    // 识别领先 = recognizedTo − 播放头。它持续下降就是"跟不上播放"的确定信号，
+    // 此时用户会看到字幕退回原文（[translate] 的降级日志会同时出现）。
+    // 窗口本身约每 30 秒媒体时间一次，这里再按 20 秒墙钟节流，不丢关键节点又不刷屏。
+    const nowAt = Date.now();
+    if (!session.lastLookaheadLogAt || nowAt - session.lastLookaheadLogAt >= 20000) {
+      session.lastLookaheadLogAt = nowAt;
+      const metrics = message.metrics || {};
+      const head = Number(session.currentVideoTime) || 0;
+      const recognized = Number(metrics.recognizedTo || 0);
+      pushLog('info', `[browser/lookahead] ${message.statusText || '滚动窗口已解码'} ` +
+        `取到=${Number(metrics.fetchedTo || 0).toFixed(1)}s 解码到=${Number(metrics.decodedTo || 0).toFixed(1)}s ` +
+        `识别到=${recognized.toFixed(1)}s 播放头=${head.toFixed(1)}s 识别领先=${(recognized - head).toFixed(1)}s`);
+    }
   }
   if (message.event === 'direct-ready' && message.sourceMode === 'direct') {
     const metrics = message.metrics || {};
@@ -2041,6 +2375,15 @@ function handleBrowserEngineEvent(message) {
         `audio=${Number(message.audioSeconds || 0).toFixed(1)}s elapsed=${(Number(message.inferenceElapsedMs || 0) / 1000).toFixed(1)}s`);
     }
   }
+  if (message.event === 'phantom-dropped') {
+    // 【静音幻觉观测点】SenseVoice 在静音/噪声/极短人声上会吐出固定英文短语
+    // （The. / Yeah. / Oh. / Magic again. …）。识别侧已整段丢弃，这里留痕，
+    // 便于回答"没说话为什么也出字幕"以及统计命中词与 voicedMs 分布。
+    pushLog('info', `[browser/phantom] 丢弃静音幻觉 token=${message.phraseToken ?? ''} ` +
+      `文案=${String(message.phantomText || '').replace(/\s+/g, ' ').slice(0, 24)} ` +
+      `voiced=${Number(message.voicedMs || 0)}ms 音频=${(Number(message.audioSeconds) || 0).toFixed(1)}s ` +
+      `断句=${message.reason || 'manual'} 撤下草稿=${message.previewRetracted ? '是' : '否'}`);
+  }
   if (message.event === 'fallback') {
     const model = session.asrProfile === 'sensevoice_browser' ? 'SenseVoice' : 'Qwen3-ASR 0.6B';
     pushLog('warn', `[browser] ${model} WebGPU FP16 → WASM CPU INT8：${message.fallbackError || '自动降级'}`);
@@ -2059,6 +2402,14 @@ function handleBrowserEngineEvent(message) {
 
 async function browserDirectTranscribeRequest(request, onProgress, control = null) {
   throwIfBrowserRequestCancelled(control);
+  if (request.directSource?.playerMediaSrc) {
+    const current = await getGenericMediaSource(Number(request.tabId));
+    if (!current || current.mediaSrc !== request.directSource.playerMediaSrc ||
+        Number(current.frameId) !== Number(request.directSource.frameId)) {
+      throw browserTaskCancelledError('主播放器或来源 frame 已变化，已取消旧视频取音');
+    }
+  }
+  throwIfBrowserRequestCancelled(control);
   const sessionId = crypto.randomUUID();
   if (control) control.engineSessionId = sessionId;
   const completion = new Promise((resolve, reject) => {
@@ -2074,10 +2425,12 @@ async function browserDirectTranscribeRequest(request, onProgress, control = nul
       previewSegment: null,
       metrics: {},
       settled: false,
+      directReferer: request.directSource?.platform === 'web' ? String(request.directSource.referer || request.sourceUrl || '') : '',
       mediaKey: String(request.mediaKey || ''),
       documentId: currentDocumentId(request.tabId, request.documentId),
       jobId: String(request.jobId || sessionId),
       asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
       title: request.title || '在线视频',
       timeout: null,
       abortTimer: null,
@@ -2102,6 +2455,7 @@ async function browserDirectTranscribeRequest(request, onProgress, control = nul
     sessionId,
     tabId: Number(request.tabId),
     asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
     backendMode: request.asrProfile === 'sensevoice_browser' && request.backendMode === 'wasm' ? 'wasm' : 'webgpu',
     cpuThreads: Number(request.cpuThreads) || 0,
     voiceEnhance: Boolean(request.voiceEnhance),
@@ -2109,6 +2463,8 @@ async function browserDirectTranscribeRequest(request, onProgress, control = nul
     sourceMode: 'direct',
     directSource: request.directSource,
     startTime: initialStartTime,
+    rollingLookahead: Boolean(request.rollingLookahead),
+    initialClock: request.initialClock,
     title: request.title || '在线视频',
     sourceUrl: request.sourceUrl || '',
     mediaKey: request.mediaKey || '',
@@ -2192,6 +2548,7 @@ async function browserCaptureTranscribeRequest(request, onProgress, control = nu
       documentId: currentDocumentId(request.tabId, request.documentId),
       jobId: String(request.jobId || sessionId),
       asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
       title: request.title || '在线视频'
     };
     session.abort = (reason = '浏览器实时字幕已取消') => {
@@ -2210,6 +2567,7 @@ async function browserCaptureTranscribeRequest(request, onProgress, control = nu
     type: externalCapture ? 'BILI_ASR_START_EXTERNAL' : 'BILI_ASR_START',
     sessionId, tabId: Number(request.tabId), streamId, initialClock,
     asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
     backendMode: request.asrProfile === 'sensevoice_browser' && request.backendMode === 'wasm' ? 'wasm' : 'webgpu', cpuThreads: Number(request.cpuThreads) || 0,
     voiceEnhance: Boolean(request.voiceEnhance), voiceEnhancePreset: request.voiceEnhancePreset || 'balanced',
     sourceMode: 'capture', silentOutput: false, rollingPreview: true, isLive: Boolean(request.isLive),
@@ -2296,6 +2654,7 @@ async function browserScanTranscribeRequest(request, onProgress, control = null,
       documentId: currentDocumentId(request.tabId, request.documentId),
       jobId: String(request.jobId || sessionId),
       asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
       title: request.title || '在线视频',
       scanPlaybackRate: Math.max(1, Math.min(8, Number(request.scanPlaybackRate) || 4))
     };
@@ -2316,6 +2675,7 @@ async function browserScanTranscribeRequest(request, onProgress, control = null,
   const startMessage = {
     type: externalCapture ? 'BILI_ASR_START_EXTERNAL' : 'BILI_ASR_START', sessionId, tabId: Number(request.tabId), streamId,
     asrProfile: request.asrProfile || DEFAULTS.asrProfile,
+    asrLanguage: request.asrLanguage || 'auto',
     backendMode: request.asrProfile === 'sensevoice_browser' && request.backendMode === 'wasm' ? 'wasm' : 'webgpu', cpuThreads: Number(request.cpuThreads) || 0,
     voiceEnhance: Boolean(request.voiceEnhance), voiceEnhancePreset: request.voiceEnhancePreset || 'balanced',
     sourceMode: 'capture', silentOutput: true, rollingPreview: false, scanMode: true,
@@ -2628,6 +2988,7 @@ function transcribeTransport(settings) {
       asrProfile: settings.asrProfile || DEFAULTS.asrProfile,
       backendMode: browserBackendMode(settings),
       cpuThreads: Number(settings.recognitionThreads) || 0,
+    asrLanguage: settings.asrLanguage || 'auto',
       voiceEnhance: Boolean(settings.voiceEnhance),
       voiceEnhancePreset: settings.voiceEnhancePreset || 'balanced',
       chunkSeconds: Number(settings.liveChunkSeconds) || SENSEVOICE_LIVE_WINDOW_SECONDS,
@@ -2680,7 +3041,7 @@ function buildSummaryBlocks(segments) {
   return blocks.filter((block) => block.text);
 }
 
-async function createResult({ tabId, title, part, sourceUrl, platform = 'bilibili', videoId, partId, bvid, cid, label, rows, pageUrl, mediaKey, documentId, mediaDuration = 0, settings = {} }) {
+async function createResult({ tabId, title, part, sourceUrl, platform = 'bilibili', videoId, partId, bvid, cid, label, rows, originalRows, pageUrl, mediaKey, documentId, mediaDuration = 0, settings = {} }) {
   const lockedVideoId = String(videoId || bvid || '');
   const lockedPartId = String(partId || cid || lockedVideoId);
   if (!lockedVideoId || !lockedPartId) throw new Error('字幕结果缺少视频身份，已拒绝保存');
@@ -2688,7 +3049,11 @@ async function createResult({ tabId, title, part, sourceUrl, platform = 'bilibil
   const segments = rows.map((row) => ({
     from: Math.max(0, Number(row.from) || 0),
     to: Math.max(Number(row.from) || 0, Number(row.to) || Number(row.from) || 0),
-    content: cleanDisplayCaption(row.content)
+    content: cleanDisplayCaption(row.content),
+    ...(row.translationVerified && row.originalContent ? {
+      translationVerified: true, originalContent: cleanDisplayCaption(row.originalContent),
+      ...(row.sourceContent ? { sourceContent: cleanDisplayCaption(row.sourceContent) } : {})
+    } : {})
   })).filter((row) => row.content);
   const summaryBlocks = buildSummaryBlocks(segments);
   const partLine = part && part !== title ? `\n分P：${part}` : '';
@@ -2719,6 +3084,9 @@ async function createResult({ tabId, title, part, sourceUrl, platform = 'bilibil
     sourceLabel: label,
     rows: segments.length,
     segments,
+    translationIdentity: segments.some(row => row.translationVerified) ? captionTranslationIdentity(settings) : '',
+    originalSegments: (originalRows || rows).map(row => ({ from: row.from, to: row.to,
+      content: cleanDisplayCaption(row.content) })).filter(row => row.content),
     summaryBlocks,
     createdAt: Date.now()
   };
@@ -2770,6 +3138,20 @@ function resultDurationMatches(recorded, expected, toleranceRatio = 0.05, tolera
   return Math.abs(left - right) <= Math.max(right * toleranceRatio, toleranceSeconds);
 }
 
+function genericPageIdentity(value) {
+  const url = new URL(value || 'https://invalid.local/');
+  url.hash = '';
+  // Ignore navigation noise that does not identify the media itself. Unknown
+  // query parameters are intentionally preserved so ?id= / ?episode= changes
+  // still invalidate stale captions and per-video translation overrides.
+  const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
+  for (const key of [...url.searchParams.keys()]) {
+    if (transient.test(key)) url.searchParams.delete(key);
+  }
+  url.searchParams.sort();
+  return url.href;
+}
+
 function resultMatchesTabUrl(result, candidateUrl) {
   try {
     const currentUrl = new URL(candidateUrl || 'https://invalid.local/');
@@ -2784,7 +3166,7 @@ function resultMatchesTabUrl(result, candidateUrl) {
       const currentId = currentUrl.searchParams.get('v') || currentUrl.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
       return currentId === result.sourceVideoId;
     }
-    return currentUrl.href === source.href;
+    return genericPageIdentity(currentUrl.href) === genericPageIdentity(source.href);
   } catch {
     return false;
   }
@@ -2901,17 +3283,6 @@ function buildSrt(rows) {
   }).filter((block) => !block.endsWith('\n')).join('\n\n') + '\n';
 }
 
-function genericPageIdentity(value) {
-  const url = new URL(value || 'https://invalid.local/');
-  url.hash = '';
-  const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|autoplay|start|t|time_continue)$/i;
-  for (const key of [...url.searchParams.keys()]) {
-    if (transient.test(key)) url.searchParams.delete(key);
-  }
-  url.searchParams.sort();
-  return url.href;
-}
-
 function matchesLiveSource(session, candidateUrl) {
   try {
     const candidate = new URL(candidateUrl || 'https://invalid.local/');
@@ -3021,7 +3392,8 @@ async function getLiveUiState(tabId, fallbackUrl = '') {
         sessionId: sourceMatches ? session.sessionId : '',
         rows: sourceMatches ? session.rows?.length || 0 : 0,
         segments: sourceMatches ? (session.rows || []).slice() : [],
-        previewSegment: sourceMatches ? session.previewSegment || null : null
+        previewSegment: sourceMatches ? session.previewSegment || null : null,
+        finalSegment: sourceMatches ? session.finalSegment || null : null
       };
     }
     return {
@@ -3039,7 +3411,9 @@ async function getLiveUiState(tabId, fallbackUrl = '') {
       queueBlocker: String(session.browserControl?.queueBlocker || ''),
       rows: session.rows?.length || 0,
       segments: (session.rows || []).slice(),
+      lookahead: session.lookaheadMetrics || null,
       previewSegment: session.previewSegment || null,
+      finalSegment: session.finalSegment || null,
       bufferedTo: Number(session.bufferedTo) || 0
     };
   }
@@ -3081,7 +3455,7 @@ function alignPayloadFileName(result) {
   return corrected;
 }
 
-async function createPayload(result, prompt, destination, autoSend = false) {
+async function createPayload(result, prompt, destination) {
   const jobId = crypto.randomUUID();
   const payload = {
     jobId,
@@ -3090,7 +3464,6 @@ async function createPayload(result, prompt, destination, autoSend = false) {
     text: result.summaryText || result.text,
     prompt,
     destination,
-    autoSend,
     sourceUrl: result.sourceUrl,
     sourcePlatform: result.sourcePlatform,
     sourceVideoId: result.sourceVideoId,
@@ -3153,8 +3526,9 @@ async function deliverToDestination({ tabId, message, settings, result }) {
   });
   throwIfExtractionCancelled(message);
   await progress(tabId, `已得到 ${result.rows} 段文本，正在打开 ${config.name}…`, 'success');
-  // "一键发送"已是默认行为：附件就绪后目标页脚本直接点击发送，不再提供开关。
-  const payload = await createPayload(result, settings[config.promptKey] || DEFAULTS[config.promptKey], message.destination, true);
+  // Chrome Web Store 审核要求：扩展只负责打开官方 AI 页面、填入提示词并附加字幕。
+  // 最终提交必须由用户在目标页面确认内容后手动完成，扩展不会点击发送 / Run。
+  const payload = await createPayload(result, settings[config.promptKey] || DEFAULTS[config.promptKey], message.destination);
   try {
     throwIfExtractionCancelled(message);
   } catch (error) {
@@ -3292,7 +3666,8 @@ async function launchYouTubeLocalTranscription({ taskId, tabId, message, setting
   if (control.cancelled) throw new Error('源视频标签页已经关闭');
   const transport = transcribeTransport(settings);
   // 优先使用播放器或 webRequest 观察到的原始已签名 GoogleVideo 音轨。
-  const audioUrl = playerState.audioFormats?.[0]?.url || '';
+  const replayCandidates = youTubeReplayCandidates(playerState);
+  const audioUrl = replayCandidates[0]?.url || '';
   await chrome.storage.local.set({ [taskKey]: {
     taskId,
     sourceTabId: tabId,
@@ -3324,13 +3699,7 @@ async function launchYouTubeLocalTranscription({ taskId, tabId, message, setting
       videoId: message.videoId,
       partId: message.videoId,
       duration: Number(playerState.lengthSeconds) || 0,
-      candidates: (playerState.audioFormats || []).filter((format) => format.url).map((format) => ({
-        url: format.url,
-        kind: 'file',
-        frameId: 0,
-        mimeType: format.mimeType || '',
-        bitrate: Number(format.bitrate) || 0
-      }))
+      candidates: replayCandidates
     }
   }), (event) => {
     if (event.type === 'segments_reset') streamedSegments.length = 0;
@@ -3727,15 +4096,7 @@ async function launchWebLocalTranscription({ taskId, tabId, message, settings, c
   if (message.localFileToken) {
     addBrowserCandidate(`bscg-local:${message.localFileToken}`, 'local-upload', 0, { token: message.localFileToken });
   } else {
-    if (generic?.mediaUrl && !/^blob:/i.test(generic.mediaUrl)) {
-      addBrowserCandidate(generic.mediaUrl, generic.manifest || /\.m3u8(?:$|[?#])/i.test(generic.mediaUrl) ? 'hls' : 'file', generic.frameId);
-    }
-    for (const entry of observed) {
-      if (!['hls', 'media'].includes(entry.kind)) continue;
-      addBrowserCandidate(entry.url, entry.kind === 'hls' ? 'hls' : 'file', entry.frameId, {
-        mimeType: entry.mimeType || '', bitrate: Number(entry.bitrate) || 0
-      });
-    }
+    browserCandidates.push(...genericReplayCandidates(generic, observed));
   }
   const audioUrl = browserCandidates[0]?.url || '';
   if (control.cancelled) throw new Error('源视频标签页已经关闭');
@@ -3757,6 +4118,7 @@ async function launchWebLocalTranscription({ taskId, tabId, message, settings, c
     directSource: {
       platform: /^file:/i.test(message.url || '') ? 'local' : 'web',
       duration: Number(generic?.duration) || 0,
+      playerMediaSrc: generic?.mediaSrc || '', frameId: Number(generic?.frameId) || 0,
       candidates: browserCandidates
     }
   }), (event) => {
@@ -3837,6 +4199,24 @@ async function setCaptionDisplay(tabId, visible, message = {}) {
   return { ok: true };
 }
 
+async function showRetainedCaptions(tabId, message) {
+  await setCaptionDisplay(tabId, true, message);
+  if (message.mode !== 'file' || liveCaptures.has(tabId) || !message.segments?.length) return { ok: true };
+  const tab = await chrome.tabs.get(tabId);
+  const pageUrl = tab.url || message.pageUrl;
+  if (message.pageUrl && videoTranslationIdentity(message.pageUrl) !== videoTranslationIdentity(pageUrl)) {
+    return { ok: false, error: '视频已切换，请重新开启字幕' };
+  }
+  const settings = await settingsForVideo(tabId, pageUrl, { ...DEFAULTS,
+    ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) });
+  const cached = await latestResultForTab(tabId, pageUrl).catch(() => null);
+  const rows = cached?.originalSegments || message.segments.slice(-MAX_LIVE_ROWS)
+    .filter(row => Number.isFinite(row?.from) && Number.isFinite(row?.to) && row.to > row.from)
+    .map(row => ({ from: row.from, to: row.to,
+      content: cleanDisplayCaption(row.originalContent || row.sourceContent || row.content) }));
+  return startCachedCaptionSession({ ...tab, url: pageUrl }, settings, rows);
+}
+
 async function getVideoClock(tabId) {
   const results = await chrome.scripting.executeScript({
     target: { tabId, allFrames: true }, world: 'MAIN', func: bscgFindMedia
@@ -3862,6 +4242,13 @@ function queueLiveMessage(session, message) {
     if (preview) { session.pendingPreviewMessage = null; session.previewMessageScheduled = false; }
     if (!outgoing) return;
     if (liveCaptures.get(session.tabId) !== session) return;
+    if (outgoing.segment && session.settings) {
+      const config = translateActiveConfig(session.settings);
+      if (config.enabled && config.displayMode === 'translated' && !outgoing.segment.translationVerified) {
+        pushLog('warn', `[translate/display] 已拦截未验证的 ${outgoing.type} 字幕`);
+        return;
+      }
+    }
     return sendLive(session.tabId, { ...outgoing, sessionId: session.sessionId });
   });
   session.liveMessageChain = next;
@@ -3875,60 +4262,10 @@ async function findVideoFrame(tabId) {
   return results.filter((entry) => entry.result).sort((a, b) => Number(b.result.score) - Number(a.result.score))[0] || null;
 }
 
-async function applyBrowserLiveMediaControl(session, action) {
-  if (!session || (session.finished && action === 'pause')) return;
-  if (action === 'pause') {
-    if (session.mediaControl) return;
-    const target = await findVideoFrame(session.tabId).catch(() => null);
-    if (!target) return;
-    const result = await chrome.scripting.executeScript({
-      target: { tabId: session.tabId, frameIds: [target.frameId] },
-      world: 'MAIN',
-      func: () => {
-        const video = [...document.querySelectorAll('video')].filter((candidate) => {
-          const rect = candidate.getBoundingClientRect();
-          const style = getComputedStyle(candidate);
-          return rect.width >= 120 && rect.height >= 90 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0.05;
-        }).sort((a, b) => {
-          const score = (v) => (Number.isFinite(v.duration) && v.duration >= 45 ? 1e12 : 0) + (!v.paused ? 3e11 : 0) + v.clientWidth * v.clientHeight;
-          return score(b) - score(a);
-        })[0];
-        if (!video) return null;
-        const wasPlaying = !video.paused && !video.ended;
-        if (wasPlaying) video.pause();
-        return { wasPlaying };
-      }
-    }).catch(() => []);
-    session.mediaControl = { frameId: target.frameId, wasPlaying: Boolean(result?.[0]?.result?.wasPlaying) };
-    return;
-  }
-  const control = session.mediaControl;
-  session.mediaControl = null;
-  if (!control?.wasPlaying) return;
-  await chrome.scripting.executeScript({
-    target: { tabId: session.tabId, frameIds: [control.frameId] },
-    world: 'MAIN',
-    func: () => {
-      const video = [...document.querySelectorAll('video')].filter((candidate) => {
-        const rect = candidate.getBoundingClientRect();
-        const style = getComputedStyle(candidate);
-        return rect.width >= 120 && rect.height >= 90 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) > 0.05;
-      }).sort((a, b) => (b.duration || 0) - (a.duration || 0) || b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
-      return video?.play?.().then(() => true).catch(() => false) || false;
-    }
-  }).catch(() => {});
-}
-
-// 模型很快命中内存缓存时，pause-for-model 与 resume-after-model 可能只相隔几
-// 毫秒。页面脚本执行是异步的；若不串行，旧实现会先执行空的 resume，再由仍在
-// 飞行的 pause 把视频留在暂停状态。每个会话按收到顺序排队，最终收尾的 resume
-// 也会等待之前的 pause 完成。
-function controlBrowserLiveMedia(session, action) {
-  if (!session) return Promise.resolve();
-  const previous = session.mediaControlChain || Promise.resolve();
-  const next = previous.catch(() => {}).then(() => applyBrowserLiveMediaControl(session, action));
-  session.mediaControlChain = next;
-  return next;
+// Subtitle generation never owns the media element. Summary scanning uses its
+// separate, explicitly requested BSCG_SCAN_* controller.
+function controlBrowserLiveMedia(_session, _action) {
+  return Promise.resolve();
 }
 
 function findLiveSession(sessionId) {
@@ -3947,79 +4284,120 @@ async function pageFetchInTab(tabId, url, requestId, maxBytes, frameId = 0) {
     world: 'MAIN',
     injectImmediately: true,
     args: [url, requestId, Math.max(1, Number(maxBytes) || 536870912)],
-    func: async (audioUrl, id, limit) => {
-      window.__BSCG_PAGE_FETCH_CONTROLLERS__ ||= new Map();
-      const controller = new AbortController();
-      window.__BSCG_PAGE_FETCH_CONTROLLERS__.set(id, controller);
-      let stallTimer = null;
-      const touch = () => {
-        clearTimeout(stallTimer);
-        stallTimer = setTimeout(() => controller.abort('audio-fetch-stalled'), 5000);
-      };
-      const emit = (payload) => window.postMessage({ marker: 'BROWSER_SENSEVOICE_PAGE_FETCH_V1', requestId: id, ...payload }, '*');
-      const toBase64 = (bytes) => {
-        let binary = '';
-        for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-          binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + 0x8000)));
-        }
-        return btoa(binary);
-      };
-      try {
-        let loaded = 0;
-        let total = 0;
-        let contentType = '';
-        for (let requestIndex = 0; requestIndex < 512; requestIndex += 1) {
-          touch();
-          const response = await fetch(audioUrl, {
-            credentials: 'include', cache: 'no-store', redirect: 'follow',
-            headers: loaded ? { Range: `bytes=${loaded}-` } : undefined,
-            signal: controller.signal
-          });
-          touch();
-          if (!response.ok) throw new Error(`HTTP ${response.status}`);
-          const contentRange = response.headers.get('content-range') || '';
-          const range = contentRange.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
-          if (response.status === 206 && !range) throw new Error('CDN 返回无法证明完整性的 206 局部响应');
-          if (range && Number(range[1]) !== loaded) throw new Error(`CDN 分段不连续：${contentRange}`);
-          if (!range && loaded) throw new Error('CDN 忽略续传 Range，无法证明音轨连续');
-          total = Math.max(total, range ? Number(range[3]) : Number(response.headers.get('content-length')) || 0);
-          if (total > limit) throw new Error(`音轨超过 ${limit} 字节限制`);
-          contentType ||= response.headers.get('content-type') || '';
-          if (requestIndex === 0) emit({ type: 'start', total, contentType });
-          const reader = response.body?.getReader();
-          if (!reader) throw new Error('页面 fetch 没有可读响应体');
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            touch();
-            loaded += value.byteLength;
-            if (loaded > limit) { await reader.cancel(); throw new Error(`音轨超过 ${limit} 字节限制`); }
-            for (let offset = 0; offset < value.length; offset += 262144) {
-              emit({ type: 'chunk', data: toBase64(value.subarray(offset, Math.min(value.length, offset + 262144))), loaded, total });
-            }
-          }
-          if (range && loaded !== Number(range[2]) + 1) throw new Error(`CDN 分段长度与 Content-Range 不符：${contentRange}`);
-          if (!range || loaded >= total) {
-            emit({ type: 'end', loaded, total, contentType });
-            return { ok: true, loaded };
-          }
-        }
-        throw new Error('CDN 音轨分段超过 512 次安全限制');
-      } catch (error) {
-        const text = error?.message || String(error);
-        emit({ type: 'error', error: text });
-        return { ok: false, error: text };
-      } finally {
-        clearTimeout(stallTimer);
-        if (window.__BSCG_PAGE_FETCH_CONTROLLERS__.get(id) === controller) {
-          window.__BSCG_PAGE_FETCH_CONTROLLERS__.delete(id);
-        }
-      }
-    }
+    func: pageFetchMediaInPage
   });
   const result = results?.[0]?.result;
   if (!result?.ok) throw new Error(result?.error || '页面音轨代理失败');
   return result;
+}
+
+// Serialized into the selected player's MAIN world; keep this self-contained.
+async function pageFetchMediaInPage(audioUrl, id, limit) {
+  window.__BSCG_PAGE_FETCH_CONTROLLERS__ ||= new Map();
+  const controller = new AbortController();
+  window.__BSCG_PAGE_FETCH_CONTROLLERS__.set(id, controller);
+  let stallTimer = null;
+  let phase = '等待响应头';
+  let received = 0;
+  let stallMs = 20000;
+  const touch = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => controller.abort('audio-fetch-stalled'), stallMs);
+  };
+  const emit = (payload) => window.postMessage({ marker: 'BROWSER_SENSEVOICE_PAGE_FETCH_V1', requestId: id, ...payload }, '*');
+  const toBase64 = (bytes) => {
+    let binary = '';
+    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(offset, Math.min(bytes.length, offset + 0x8000)));
+    }
+    return btoa(binary);
+  };
+  try {
+    let loaded = 0;
+    let total = 0;
+    let contentType = '';
+    // HLS CDNs commonly allow the page Origin but not credentialed CORS.
+    // Same-origin preserves local cookies without requiring ACAC remotely.
+    // Retry cookie authentication only before reading any response bytes.
+    const origin = new URL(audioUrl).origin;
+    const page = location.href;
+    window.__BSCG_PAGE_FETCH_CREDENTIALS__ ||= new Map();
+    const modes = window.__BSCG_PAGE_FETCH_CREDENTIALS__;
+    const remembered = modes.get(origin);
+    let credentials = remembered?.page === page ? remembered.mode : 'same-origin';
+    for (let requestIndex = 0; requestIndex < 512; requestIndex += 1) {
+      let response;
+      const failures = [];
+      for (const mode of [credentials, credentials === 'include' ? 'same-origin' : 'include']) {
+        if (controller.signal.aborted) throw new Error('页面音轨请求已取消');
+        phase = '等待响应头'; stallMs = 20000;
+        emit({ type: 'progress', loaded, phase });
+        touch();
+        try {
+          response = await fetch(audioUrl, {
+            credentials: mode, cache: 'no-store', redirect: 'follow',
+            headers: loaded ? { Range: `bytes=${loaded}-` } : undefined,
+            signal: controller.signal
+          });
+        } catch (error) {
+          if (controller.signal.aborted) throw error;
+          failures.push(`${mode}: ${error?.message || String(error)}`);
+          continue;
+        }
+        if (response.ok) { credentials = mode; break; }
+        const status = response.status;
+        void response.body?.cancel().catch(() => {});
+        response = null;
+        failures.push(`${mode}: HTTP ${status}`);
+        if (status !== 401 && status !== 403) break;
+      }
+      if (!response?.ok) throw new Error(`页面读取失败（${failures.join('；')}）`);
+      modes.set(origin, { page, mode: credentials });
+      while (modes.size > 64) modes.delete(modes.keys().next().value);
+      phase = '读取响应体'; stallMs = 15000;
+      touch();
+      const contentRange = response.headers.get('content-range') || '';
+      const range = contentRange.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+      if (response.status === 206 && !range) throw new Error('CDN 返回无法证明完整性的 206 局部响应');
+      if (range && Number(range[1]) !== loaded) throw new Error(`CDN 分段不连续：${contentRange}`);
+      if (!range && loaded) throw new Error('CDN 忽略续传 Range，无法证明音轨连续');
+      total = Math.max(total, range ? Number(range[3]) : Number(response.headers.get('content-length')) || 0);
+      if (total > limit) throw new Error(`音轨超过 ${limit} 字节限制`);
+      contentType ||= response.headers.get('content-type') || '';
+      if (requestIndex === 0) emit({ type: 'start', total, contentType });
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error('页面 fetch 没有可读响应体');
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        touch();
+        loaded += value.byteLength;
+        received = loaded;
+        if (loaded > limit) { await reader.cancel(); throw new Error(`音轨超过 ${limit} 字节限制`); }
+        for (let offset = 0; offset < value.length; offset += 262144) {
+          emit({ type: 'chunk', data: toBase64(value.subarray(offset, Math.min(value.length, offset + 262144))), loaded, total });
+        }
+      }
+      if (range && loaded !== Number(range[2]) + 1) throw new Error(`CDN 分段长度与 Content-Range 不符：${contentRange}`);
+      if (!range || loaded >= total) {
+        emit({ type: 'end', loaded, total, contentType });
+        return { ok: true, loaded };
+      }
+    }
+    throw new Error('CDN 音轨分段超过 512 次安全限制');
+  } catch (error) {
+    const text = controller.signal.reason === 'audio-fetch-stalled'
+      ? `页面音轨超时：${phase}连续 ${stallMs / 1000} 秒无数据（已收 ${received} 字节）`
+      : error?.message || String(error);
+    emit({ type: 'error', error: text });
+    return { ok: false, error: text };
+  } finally {
+    clearTimeout(stallTimer);
+    if (!controller.signal.aborted) controller.abort('page-fetch-finished');
+    if (window.__BSCG_PAGE_FETCH_CONTROLLERS__.get(id) === controller) {
+      window.__BSCG_PAGE_FETCH_CONTROLLERS__.delete(id);
+    }
+  }
 }
 
 async function pageFetchCancelInTab(tabId, requestId, frameId = 0) {
@@ -4057,7 +4435,7 @@ async function ensureOffscreenDocument() {
 // offscreen 文档可能因浏览器回收而消失（"Receiving end does not exist"）。
 // 统一入口：先确保文档存在，再发消息；连接错误时重建文档并重试一次。
 async function sendToOffscreen(message) {
-  const readOnly = ['BILI_ASR_CAPABILITIES', 'BILI_ASR_GET_STATE', 'BILI_ASR_BENCHMARK_STATUS', 'BILI_ASR_MODEL_DOWNLOAD_STATUS'].includes(message.type);
+  const readOnly = ['BILI_ASR_CAPABILITIES', 'BILI_ASR_GET_STATE', 'BILI_ASR_BENCHMARK_STATUS', 'BILI_ASR_MODEL_DOWNLOAD_STATUS', 'BILI_ASR_TRANSLATE_ONNX_STATUS'].includes(message.type);
   if (!readOnly) {
     if (offscreenCloseTimer) { clearTimeout(offscreenCloseTimer); offscreenCloseTimer = null; }
     await chrome.alarms.clear(OFFSCREEN_IDLE_ALARM);
@@ -4085,6 +4463,11 @@ async function closeIdleOffscreenDocument() {
   if (liveCaptures.size || browserEngineSessions.size || activeBrowserRequest || browserRequestQueue.length || activeBenchmarkId || activeModelDownloadId || creatingOffscreenDocument) return;
   // Read the offscreen owner's state: service-worker globals may have been lost
   // during suspension. A status read must not create a new offscreen document.
+  const translation = await chrome.runtime.sendMessage({ type: 'BILI_ASR_TRANSLATE_ONNX_STATUS', target: 'offscreen' }).catch(() => null);
+  if (translation?.busy) {
+    await chrome.alarms.create(OFFSCREEN_IDLE_ALARM, { delayInMinutes: 5 });
+    return;
+  }
   const runtime = await chrome.runtime.sendMessage({ type: 'BILI_ASR_CAPABILITIES', target: 'offscreen' }).catch(() => null);
   if (!runtime) return;
   if (runtime.activeSession || runtime.initializing || runtime.benchmark?.status === 'running' || runtime.modelDownload?.status === 'running') {
@@ -4128,10 +4511,11 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
   // 前瞻字幕翻译：先把展示缓冲里最后一段落地并送翻，等翻译队列彻底清空后再读 rows，
   // 保证导出的 SRT、写入缓存与发去总结的文本同文同种（全是译文）。
   publishTranslatedCaptionSegment(session, null, true);
-  if (session.translator) {
-    if (session.stopRequested) session.translator.abort?.('用户停止字幕');
-    else await session.translator.finish().catch(() => {});
-  }
+  let finishingTranslator;
+  do {
+    finishingTranslator = session.translator;
+    if (finishingTranslator) await finishingTranslator.finish().catch(() => {});
+  } while (session.translator !== finishingTranslator);
   const completionReason = String(inferenceMessage?.reason || inferenceMessage?.metrics?.completionReason || session.stopReason || 'unknown');
   pushLog('info', `[session] 任务收尾 tab=${session.tabId} mode=${session.mode} ` +
     `reason=${completionReason} 共 ${Array.isArray(session.rows) ? session.rows.length : 0} 段`);
@@ -4140,15 +4524,12 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
   if (session.positionHeartbeat) clearInterval(session.positionHeartbeat);
   if (session.borrowWatch) clearInterval(session.borrowWatch);
   const rows = Array.isArray(session.rows) ? session.rows : inferenceMessage.segments || [];
-  // 双语模式只在页面上叠加原文小字，导出/缓存/总结一律只用译文行，
-  // 否则发去总结的整段会变成中英夹杂。
-  const exportRows = rows.map((row) => row.sourceContent
-    ? { from: row.from, to: row.to, content: row.content }
-    : row);
+  // 保留原文与翻译身份元数据供缓存回放；createResult 的文本导出只读取 content。
+  const exportRows = rows;
   // 缓存策略：只有自然完成的会话（读到音轨末尾/收尾完整）才把结果写入缓存供
   // "总结"复用。用户手动点停的会话只覆盖了"已播放部分"，写进缓存后会被总结
   // 当成完整结果发送——这是"总结发了没生成完的字幕"的根因，改为不落缓存。
-  const cacheableComplete = !session.isLive && !session.stopRequested && session.fullTrack &&
+  const cacheableComplete = !session.translationFailures && !session.isLive && !session.stopRequested && session.fullTrack &&
     (session.mode === 'browser-direct' ? completionReason === 'direct-complete' :
       ['media-ended', 'stream-ended'].includes(completionReason) && !inferenceMessage?.metrics?.modelWarmupDropped &&
       !inferenceMessage?.metrics?.failedSegments && !inferenceMessage?.metrics?.captureSeeks &&
@@ -4168,7 +4549,8 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
       settings: session.settings,
       label: localEngineLabel(session.settings, true),
       mediaDuration: Number(session.mediaDuration) || 0,
-      rows: exportRows
+      rows: exportRows,
+      originalRows: session.originalCaptionRows ? [...session.originalCaptionRows.values()] : exportRows
     });
   } else if (rows.length && session.stopRequested) {
     pushLog('info', `[session] 手动停止：${rows.length} 段仅保留在页面预览/导出，不写入缓存（防止总结发送半成品）`);
@@ -4187,8 +4569,8 @@ async function finalizeLiveCaptureNow(session, inferenceMessage) {
 
 async function failLiveCapture(session, error) {
   if (!session || session.finished) return;
+  session.translator?.cancel?.();
   pushLog('error', `[session] 任务失败 tab=${session.tabId} mode=${session.mode}：${error}`);
-  session.translator?.abort?.(error || '字幕任务已停止');
   session.finished = true;
   releaseBorrowedTask(session);
   if (session.stopTimer) clearTimeout(session.stopTimer);
@@ -4232,6 +4614,10 @@ function attachBorrowedTask(session, task) {
       src: 'borrow'
     };
     if (!normalized.content) return;
+    if (session.publishCaptionSegment) {
+      session.publishCaptionSegment(normalized);
+      return;
+    }
     addTimelineSegment(session, normalized, { src: 'borrow' });
     void queueLiveMessage(session, { type: 'BSCG_LIVE_SEGMENT', segment: { from: normalized.from, to: normalized.to, content: normalized.content }, bufferedTo: Number(session.bufferedTo) || normalized.to });
   };
@@ -4254,13 +4640,19 @@ function addTimelineSegment(session, segment, opts = {}) {
   // 双语模式：译文放 content，识别原文放 sourceContent，页面按小字号渲染第二行。
   const sourceContent = cleanDisplayCaption(segment.sourceContent);
   if (sourceContent) normalized.sourceContent = sourceContent;
+  const originalContent = cleanDisplayCaption(segment.originalContent);
+  if (originalContent) normalized.originalContent = originalContent;
+  if (segment.translationVerified) normalized.translationVerified = true;
+  if (segment.id) normalized.id = String(segment.id);
+  if (segment.singleLine) normalized.singleLine = true;
   if (opts.src) normalized.src = opts.src;
   if (opts.src === 'borrow') {
     // 借用内容优先：清掉本地前瞻生成的重叠行，避免同段双份
     session.rows = session.rows.filter((row) => row.src === 'borrow' || row.to <= normalized.from || row.from >= normalized.to);
   } else if (session.borrowTask) {
     // 本会话正在借用转写任务：与借用内容重叠的区域不再本地重复生成
-    if (session.rows.some((row) => row.src === 'borrow' && row.to > normalized.from && row.from < normalized.to)) return null;
+    if (session.rows.some((row) => row.src === 'borrow' && row.to > normalized.from && row.from < normalized.to &&
+      Math.abs(row.from - normalized.from) >= 0.05)) return null;
   }
   let low = 0;
   let high = session.rows.length;
@@ -4269,11 +4661,37 @@ function addTimelineSegment(session, segment, opts = {}) {
     if (session.rows[middle].from < normalized.from) low = middle + 1;
     else high = middle;
   }
-  const nearIndex = [low - 1, low].find((index) => index >= 0 && index < session.rows.length && Math.abs(session.rows[index].from - normalized.from) < 0.05);
+  const duplicate = findSameCaptionOccurrence(session.rows, normalized);
+  if (duplicate) {
+    // Keep the canonical start used by the page and translation cache.
+    normalized.from = duplicate.from;
+    normalized.to = duplicate.to;
+  }
+  const nearIndex = duplicate ? session.rows.indexOf(duplicate)
+    : [low - 1, low].find((index) => index >= 0 && index < session.rows.length && Math.abs(session.rows[index].from - normalized.from) < 0.05);
   if (nearIndex !== undefined) session.rows[nearIndex] = normalized;
   else session.rows.splice(low, 0, normalized);
   if (session.rows.length > MAX_LIVE_ROWS) session.rows.splice(0, session.rows.length - MAX_LIVE_ROWS);
+  if (normalized.translationVerified && normalized.originalContent) {
+    session.translationRows ||= new Map();
+    session.translationRows.set(captionTranslationKey({ ...normalized, content: normalized.originalContent }), normalized);
+    if (session.translationRows.size > MAX_LIVE_ROWS) session.translationRows.delete(session.translationRows.keys().next().value);
+  }
   return normalized;
+}
+
+function findSameCaptionOccurrence(rows, candidate) {
+  const key = row => String(row.originalContent || row.sourceContent || row.content || '')
+    .toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+  const text = key(candidate);
+  if (!text) return null;
+  for (const row of rows) {
+    if (Math.abs(row.from - candidate.from) > 0.25 || Math.abs(row.to - candidate.to) > 0.35) continue;
+    const overlap = Math.min(row.to, candidate.to) - Math.max(row.from, candidate.from);
+    const duration = Math.min(row.to - row.from, candidate.to - candidate.from);
+    if (duration > 0 && overlap >= duration * 0.6 && key(row) === text) return row;
+  }
+  return null;
 }
 
 function captionTextLength(value) {
@@ -4405,10 +4823,13 @@ function queueDisplaySegments(session, recognizedSegment, flush = false) {
 // deferDisplay=true 时只切分并落 rows，暂不发给页面——由翻译队列在译文就绪后
 // （或判断领先量不足时）自行上屏，从而实现"第一个版本就是译文"。
 function publishRecognizedSegment(session, recognizedSegment, metadata = {}, flush = false, deferDisplay = false) {
-  const displayed = queueDisplaySegments(session, recognizedSegment, flush);
+  // Recognition timestamps describe audio units, not equally paced characters.
+  // Keep the complete timed unit for translation; wrapping belongs to the UI.
+  const displayed = recognizedSegment?.content ? [recognizedSegment] : [];
   const published = [];
   displayed.forEach((candidate, index) => {
-    const segment = addTimelineSegment(session, candidate);
+    const segment = deferDisplay ? { from: candidate.from, to: candidate.to,
+      content: cleanDisplayCaption(candidate.content) } : addTimelineSegment(session, candidate);
     if (!segment) return;
     published.push(segment);
     if (deferDisplay) return;
@@ -4430,11 +4851,13 @@ function publishRecognizedSegment(session, recognizedSegment, metadata = {}, flu
 // 译文回填、"先原文兜底后换译文"都靠这个语义。刻意不走 splitRecognizedCaption/
 // queueDisplaySegments：译文长度与识别原文不同，重新切分会把时间轴推歪并产生重复行。
 function emitCaptionRow(session, row) {
+  const original = session.originalCaptionRows?.get(Number(row.from).toFixed(3));
+  if (original) row = { ...row, originalContent: original.content };
   const segment = addTimelineSegment(session, row);
   if (!segment) return null;
   void queueLiveMessage(session, {
     type: 'BSCG_LIVE_SEGMENT',
-    finalDisplayManaged: session.mode === 'browser-capture',
+    finalDisplayManaged: session.mode === 'browser-capture' && !session.translator,
     sequence: session.rows.length,
     segment,
     bufferedTo: Number(session.bufferedTo) || 0
@@ -4442,30 +4865,442 @@ function emitCaptionRow(session, row) {
   return segment;
 }
 
-// 前瞻字幕翻译器：只服务"能直接取到音轨"的整轨识别路径（B站音轨、YouTube 音轨，
-// 以及其他站点的 M3U8/MP4）。
-//
-// 显示策略：识别进度会一路领先播放头，所以只要领先量足够（≥ DISPLAY_LEAD_SECONDS），
-// 就压着不上屏，等这一批译文回来直接显示译文——用户看到的第一个版本就是译文，
-// 而不是"先原文、再原地覆盖"。领先量不够（用户快进/回拖到刚识别的区域）或翻译
-// 失败/中止时，立刻回落到显示识别原文，字幕永不留空。
-// 未启用或未配置时返回 null，调用方保持原有发布路径，行为与旧版完全一致。
-function startBrowserDirectTranslator(session, settings, onError) {
+// 各取音方式复用翻译入口；捕获模式只翻译识别定稿，保存原音频时间范围。
+// 仅译文模式等待译文，双语前瞻允许原文兜底。原文单独保存供设置切换与缓存使用。
+function videoTranslationIdentity(pageUrl) {
+  const url = new URL(pageUrl);
+  if (/(^|\.)bilibili\.com$/i.test(url.hostname)) {
+    const bvid = url.pathname.match(/\/video\/(BV[0-9A-Za-z]+)/i)?.[1];
+    if (bvid) return `bilibili:${bvid}:p${Math.max(1, Number(url.searchParams.get('p')) || 1)}`;
+  }
+  if (/(^|\.)youtube\.com$/i.test(url.hostname)) {
+    const id = url.searchParams.get('v') || url.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1];
+    if (id) return `youtube:${id}`;
+  }
+  return genericPageIdentity(url.href);
+}
+
+async function settingsForVideo(tabId, pageUrl, settings) {
+  const key = `videoTranslation:${tabId}:${videoTranslationIdentity(pageUrl)}`;
+  const stored = await chrome.storage.session.get(key);
+  const choice = stored[key];
+  return choice === 'on' || choice === 'off'
+    ? { ...settings, translateEnabled: choice === 'on' } : { ...settings };
+}
+
+function configureSessionTranslator(session, settings) {
+  session.translator?.cancel?.();
+  session.previewSegment = null;
+  session.finalSegment = null;
+  void queueLiveMessage(session, { type: 'BSCG_LIVE_PREVIEW_CLEAR' });
+  session.settings = settings;
   const config = translateActiveConfig(settings);
+  const identity = captionTranslationIdentity(settings);
+  const reuse = session.translationIdentity === identity;
+  session.translationIdentity = identity;
+  session.lookaheadMetrics ||= { anchor: Number(session.currentVideoTime) || 0,
+    recognizedTo: Number(session.currentVideoTime) || 0, translatedContiguousTo: Number(session.currentVideoTime) || 0 };
+  session.originalCaptionRows ||= new Map();
+  for (const row of session.rows || []) {
+    const key = Number(row.from).toFixed(3);
+    if (!session.originalCaptionRows.has(key)) session.originalCaptionRows.set(key, {
+      from: row.from, to: row.to, content: row.originalContent || row.sourceContent || row.content
+    });
+  }
+  if (config.enabled) {
+    const retained = reuse ? (session.rows || []).filter(row => row.translationVerified && row.originalContent) : [];
+    session.rows = retained;
+    session.translationRows = new Map(retained.map(row => [captionTranslationKey({ ...row, content: row.originalContent }), row]));
+    // A seek must not erase already translated timeline intervals in the page.
+    if (!reuse) {
+      void queueLiveMessage(session, { type: 'BSCG_LIVE_INVALIDATE_RANGE', from: 0, to: Number.MAX_SAFE_INTEGER });
+    }
+  } else {
+    session.translationRows = new Map();
+  }
+  session.translator = startBrowserDirectTranslator(session, settings, (error) => {
+    session.translationFailures = (session.translationFailures || 0) + 1;
+    // 走到这里说明已经熔断（内容级失败会先在 drain() 里逐行重试，不回调本函数）。
+    // 文案必须说清"不会自动恢复"：旧文案让人以为等一会儿译文就会自己接上。
+    void queueLiveMessage(session, {
+      type: 'BSCG_LIVE_PROGRESS',
+      text: config.displayMode === 'translated'
+        ? `翻译已停止：${String(error).slice(0, 90)}；仅译文模式不会显示未验证原文，拖动进度条或重新开始字幕即可恢复`
+        : `翻译已停止：${String(error).slice(0, 90)}；后续字幕只显示识别原文，拖动进度条或重新开始字幕即可恢复`
+    });
+  });
+  const originals = [...session.originalCaptionRows.values()];
+  if (session.mode === 'browser-cache') session.lookaheadMetrics.recognizedTo = Math.max(
+    session.lookaheadMetrics.anchor, ...originals.map(row => Number(row.to) || 0));
+  const missing = originals.filter(row => !session.translationRows?.has(captionTranslationKey(row)));
+  if (session.translator) session.translator.pushBacklog(session.translationSeekAnchor == null ? missing
+    : missing.filter(row => row.to >= session.translationSeekAnchor && row.from < session.translationSeekAnchor + 60));
+  else if (!config.enabled || config.displayMode !== 'translated') for (const row of originals) emitCaptionRow(session, row);
+  session.publishCaptionSegment = (segment) => {
+    session.bufferedTo = Math.max(Number(session.bufferedTo) || 0, Number(segment?.to) || 0);
+    if (segment?.src === 'borrow') {
+      const row = config.enabled && config.displayMode === 'translated'
+        ? { ...segment } : addTimelineSegment(session, segment, { src: 'borrow' });
+      if (!row) return;
+      session.originalCaptionRows.set(Number(row.from).toFixed(3), { from: row.from, to: row.to, content: row.content });
+      if (session.translator && !session.translator.isStopped()) session.translator.enqueue([row]);
+      else if (!config.enabled || config.displayMode !== 'translated') emitCaptionRow(session, row);
+      return;
+    }
+    publishTranslatedCaptionSegment(session, segment);
+  };
+  if (config.enabled && !session.translator) {
+    void queueLiveMessage(session, { type: 'BSCG_LIVE_PROGRESS', text: `翻译暂不可用：${translateUnavailableReason(config)}` });
+  }
+}
+
+function captionTranslationIdentity(settings) {
+  const config = translateActiveConfig(settings);
+  // Deliberately exclude credentials. Version the segmentation policy as well.
+  return JSON.stringify([4, config.enabled, config.mode, config.model, config.baseUrl,
+    config.sourceLanguage, config.targetLanguage, config.displayMode,
+    settings.asrProfile, settings.asrLanguage]);
+}
+
+function finalCaptionUnits(segment) {
+  const { timedSegments, ...base } = segment;
+  const units = Array.isArray(timedSegments) && timedSegments.length ? timedSegments : [base];
+  return units.map((unit, index) => ({ ...base, ...unit, id: `${base.id}:sentence:${index}` }));
+}
+
+function captionTranslationKey(row) {
+  return JSON.stringify([Number(row.from).toFixed(3), Number(row.to).toFixed(3), String(row.content)]);
+}
+
+async function refreshLiveTranslationSettings() {
+  const revision = ++liveTranslationRefreshRevision;
+  const stored = { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+  if (revision !== liveTranslationRefreshRevision) return;
+  const translationSettings = Object.fromEntries(Object.entries(stored).filter(([key]) => key === 'language' || key.startsWith('translate')));
+  for (const session of liveCaptures.values()) {
+    if (session.finished || session.stopRequested) continue;
+    const settings = await settingsForVideo(session.tabId, session.sourceUrl, { ...session.settings, ...translationSettings });
+    if (revision !== liveTranslationRefreshRevision) return;
+    if (liveCaptures.get(session.tabId) !== session || session.finished || session.stopRequested) continue;
+    if (JSON.stringify(translateActiveConfig(settings)) !== JSON.stringify(translateActiveConfig(session.settings))) {
+      configureSessionTranslator(session, settings);
+    }
+  }
+}
+
+async function videoTranslationPreference(tabId, message) {
+  const tab = await chrome.tabs.get(tabId);
+  const pageUrl = tab.url || message.pageUrl;
+  if (message.pageUrl && videoTranslationIdentity(message.pageUrl) !== videoTranslationIdentity(pageUrl)) {
+    throw new Error('视频已切换，请重新打开翻译选项');
+  }
+  const key = `videoTranslation:${tabId}:${videoTranslationIdentity(pageUrl)}`;
+  if (message.type === 'BSCG_VIDEO_TRANSLATION_SET') {
+    if (!['inherit', 'on', 'off'].includes(message.choice)) throw new Error('翻译选项无效');
+    if (message.choice === 'inherit') await chrome.storage.session.remove(key);
+    else await chrome.storage.session.set({ [key]: message.choice });
+  }
+  const globalSettings = { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+  const settings = await settingsForVideo(tabId, pageUrl, globalSettings);
+  const choice = (await chrome.storage.session.get(key))[key] || 'inherit';
+  const config = translateActiveConfig(settings);
+  if (message.type === 'BSCG_VIDEO_TRANSLATION_SET') {
+    const session = liveCaptures.get(tabId);
+    if (session && !session.finished && videoTranslationIdentity(session.sourceUrl) === videoTranslationIdentity(pageUrl)) {
+      configureSessionTranslator(session, settings);
+    } else if (message.captionsVisible) {
+      const cached = await latestResultForTab(tabId, pageUrl).catch(() => null);
+      const rows = cached?.originalSegments || cached?.segments || (Array.isArray(message.segments)
+        ? message.segments.slice(-MAX_LIVE_ROWS).map(row => ({ from: row.from, to: row.to,
+          content: row.originalContent || row.sourceContent || row.content })) : null);
+      if (rows?.length) await startCachedCaptionSession(tab, settings, rows, cached);
+    }
+  }
+  return { ok: true, choice, enabled: config.enabled, ready: translateIsReady(config),
+    reason: translateUnavailableReason(config), globalEnabled: Boolean(globalSettings.translateEnabled),
+    sourceLanguage: config.sourceLanguage, targetLanguage: config.targetLanguage, translationMode: config.mode };
+}
+
+async function startCachedCaptionSession(tab, settings, rows, cached = null) {
+  const clock = await getVideoClock(tab.id);
+  const identity = captionTranslationIdentity(settings);
+  const reuse = cached?.translationIdentity === identity;
+  const displayRows = reuse ? cached.segments : rows;
+  const session = { tabId: tab.id, sessionId: crypto.randomUUID(), mode: 'browser-cache',
+    sourceUrl: tab.url, title: tab.title || '视频字幕', settings, rows: displayRows.map(row => ({ ...row })),
+    translationIdentity: reuse ? identity : '',
+    originalCaptionRows: new Map(rows.map(row => [Number(row.from).toFixed(3), { ...row }])),
+    currentVideoTime: Number(clock?.currentTime) || 0, finished: false, fullTrack: false };
+  liveCaptures.set(tab.id, session);
+  await injectLiveOverlay(tab.id);
+  await sendLive(tab.id, { type: 'BSCG_LIVE_REUSED', sessionId: session.sessionId,
+    mode: 'timeline', segments: !translateActiveConfig(settings).enabled || reuse ? session.rows : [], rows: session.rows.length, title: session.title });
+  configureSessionTranslator(session, settings);
+  void finalizeLiveCapture(session, { segments: session.rows });
+  return { ok: true, reused: true, sessionId: session.sessionId, mode: 'timeline', segments: session.rows, rows: session.rows.length };
+}
+
+// 实时捕获按完整识别句翻译。草稿只保留最新待处理版本，定稿优先且仅定稿入时间轴。
+function startRealtimeCaptionTranslator(session, config, onError) {
+  const requestController = new AbortController();
+  config = { ...config, abortSignal: requestController.signal };
+  let stopped = false;
+  let inflight = null;
+  let preview = null;
+  let displayedOrder = 0;
+  let newestCueFrom = -Infinity;
+  let order = 0;
+  let translated = 0;
+  let displayEpoch = 0;
+  let lastLatencyMs = 0;
+  const finals = [];
+  const finalKeys = new Set();
+  const translationCache = new Map();
+  const lastDraftText = new Map();
+  const draftRuns = new Map();
+  const versions = new Map();
+  const finalized = new Set();
+  const latencies = [];
+  // 失败节流：模型不可达时每一句都会失败，不节流会在几分钟内刷满日志缓冲区。
+  let lastFailNote = '';
+  let lastFailAt = 0;
+  const latencyP95 = (list) => list.length
+    ? list.slice().sort((a, b) => a - b)[Math.min(list.length - 1, Math.ceil(list.length * .95) - 1)]
+    : 0;
+  let resolveCancelled;
+  const cancelled = new Promise(resolve => { resolveCancelled = resolve; });
+  const idFor = row => String(row.id || `row:${Number(row.from).toFixed(3)}`);
+  // 日志对照用：实时链路逐句翻译，原文→译文是定位"中日掺杂"的唯一线索。
+  const clip = (s, n = 40) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  function enqueueCue(row, final = false, silent = false) {
+    if (stopped || !row?.content) return;
+    if (!final && config.finalOnly) return;
+    row = { ...row, content: BSCG_TRANSLATE.normalizeSubtitleText(row.content) };
+    if (final) {
+      const duplicate = findSameCaptionOccurrence(session.originalCaptionRows.values(), row);
+      if (duplicate) row = { ...row, from: duplicate.from, to: duplicate.to, content: duplicate.content };
+      // IDs may change on rewind; use canonical audio position for final deduplication.
+      const key = captionTranslationKey(row);
+      if (finals.some(job => captionTranslationKey(job.row) === key) || finalKeys.has(key)) return;
+      finalKeys.add(key);
+      while (finalKeys.size > MAX_LIVE_ROWS) finalKeys.delete(finalKeys.values().next().value);
+    }
+    if (final && session.translationRows?.has(captionTranslationKey(row))) return;
+    if (!final && Object.hasOwn(row, 'stableContent')) {
+      // A stable character prefix can still end before a Japanese predicate.
+      // Translate only a stable complete clause, never blindly cut two chars.
+      const stable = BSCG_TRANSLATE.normalizeSubtitleText(row.stableContent);
+      const end = [...stable.matchAll(/[。！？!?；;]/gu)].at(-1);
+      const id = idFor(row);
+      if ((draftRuns.get(id) || 0) >= 2) return;
+      if (end) {
+        const content = stable.slice(0, end.index + 1);
+        if (Array.from(content).length < 4) return;
+        row.content = content;
+      } else {
+        // Waiting only for a stable period can hide translations for the entire
+        // 11.5s window. Permit one substantial full hypothesis as a provisional
+        // draft, then wait for a stable clause or the final (never a cut prefix).
+        if (lastDraftText.has(id) || Number(row.to) - Number(row.from) < 2 ||
+            Array.from(row.content).length < 8) return;
+      }
+    }
+    const id = idFor(row);
+    if (finalized.has(id)) return;
+    if (!final && lastDraftText.get(id) === row.content) return;
+    if (!final) lastDraftText.set(id, row.content);
+    while (lastDraftText.size > 64) lastDraftText.delete(lastDraftText.keys().next().value);
+    // 新草稿到来时保留在途译文的显示机会，避免 ASR 比翻译快时草稿一直被丢弃。
+    // 定稿、清除与取消才使在途草稿失效。
+    const version = (versions.get(id) || 0) + Number(final);
+    versions.set(id, version);
+    const job = { row: { ...row }, id, version, final, silent, epoch: displayEpoch, order: ++order, queuedAt: Date.now() };
+    if (!silent) newestCueFrom = Math.max(newestCueFrom, Number(row.from) || 0);
+    if (final) {
+      finalized.add(id);
+      if (preview?.id === id) preview = null;
+      finals.push(job);
+      session.originalCaptionRows.set(Number(row.from).toFixed(3), {
+        from: row.from, to: row.to, content: row.content
+      });
+    } else preview = job;
+    if (finalized.size > 64) {
+      const oldest = finalized.values().next().value;
+      if (!finals.some(item => item.id === oldest)) { finalized.delete(oldest); versions.delete(oldest); }
+    }
+    void pump();
+  }
+  async function drain() {
+    while (!stopped && (finals.length || preview)) {
+      const job = finals.shift() || preview;
+      if (job === preview) preview = null;
+      const began = Date.now();
+      try {
+        if (!job.final && Object.hasOwn(job.row, 'stableContent')) {
+          const count = draftRuns.get(job.id) || 0;
+          if (count >= 2) continue;
+          draftRuns.set(job.id, count + 1);
+          while (draftRuns.size > 64) draftRuns.delete(draftRuns.keys().next().value);
+        }
+        const cached = translationCache.get(job.row.content);
+        const result = cached ? { ok: true, texts: [cached] }
+          : await BSCG_TRANSLATE.translateWithQualityRetry({ ...config, realtime: true }, [job.row.content],
+            translateWithConfiguredModel, issue => pushLog('warn', `[translate/quality] ${issue} id=${job.id}`), () => stopped);
+        lastLatencyMs = Date.now() - began;
+        if (!cached) latencies.push(lastLatencyMs);
+        if (latencies.length > 20) latencies.shift();
+        if (!result.ok || result.texts?.length !== 1 || !cleanDisplayCaption(result.texts[0])) {
+          throw new Error(result.error || '模型未返回单句译文');
+        }
+        if (stopped) continue;
+        // Cache a completed draft before checking its display revision: its
+        // identical final may already be waiting and can reuse this generation.
+        translationCache.delete(job.row.content);
+        translationCache.set(job.row.content, result.texts[0]);
+        if (translationCache.size > 64) translationCache.delete(translationCache.keys().next().value);
+        if (versions.get(job.id) !== job.version) continue;
+        const row = { ...job.row, id: job.id, content: cleanDisplayCaption(result.texts[0]),
+          originalContent: job.row.content, stableContent: '', provisional: !job.final, singleLine: true, translationVerified: true };
+        if (config.displayMode === 'bilingual') row.sourceContent = job.row.content;
+        else delete row.sourceContent;
+        // 后到的上一句定稿仍保存，但不盖住已显示的下一句草稿。
+        const visible = job.epoch === displayEpoch && !job.silent && (job.final ||
+          ((Number(row.from) || 0) >= newestCueFrom - 0.05 && job.order >= displayedOrder));
+        if (job.final) {
+          const segment = addTimelineSegment(session, row);
+          void queueLiveMessage(session, { type: 'BSCG_LIVE_SEGMENT', segment,
+            finalDisplayManaged: true, bufferedTo: session.bufferedTo });
+          if (visible) {
+            session.finalSegment = row;
+            if (session.previewSegment?.id === job.id) session.previewSegment = null;
+            void queueLiveMessage(session, { type: 'BSCG_LIVE_FINAL', segment: row });
+          }
+        } else if (visible) {
+          session.previewSegment = row;
+          void queueLiveMessage(session, { type: 'BSCG_LIVE_PREVIEW', previewId: job.id,
+            revision: row.revision, segment: row });
+        }
+        if (visible) displayedOrder = Math.max(displayedOrder, job.order);
+        translated++;
+        // 实时链路逐句翻译，原文→译文对照是定位"中日掺杂"的唯一线索：
+        // 草稿译文上屏后若定稿原文后到且 visible，日语会覆盖中文再被下一句定稿译文覆盖。
+        pushLog('info', `[translate/realtime] ${job.final ? '定稿' : '草稿'} 单句 ${lastLatencyMs}ms ` +
+          `排队=${began - job.queuedAt}ms${cached ? ' 复用译文' : ''} id=${job.id}` +
+          ` 发出延迟=${job.row.asrReadyAt ? Date.now() - job.row.asrReadyAt : 'unknown'}ms · ` +
+          `[原]${clip(job.row.content)}→[译]${clip(row.content)}`);
+      } catch (error) {
+        if (job.final) finalKeys.delete(captionTranslationKey(job.row));
+        if (stopped || versions.get(job.id) !== job.version) continue;
+        // 单句失败不停止后续翻译，也不向仅译文模式泄漏原文。但这正是"字幕一直
+        // 显示原文"最常见的根因（模型不可达 / 超时 / 返回空），必须留痕；
+        // 相同原因 10 秒内只记一条，防止整段失败把日志刷满。
+        const note = String(error?.message || error);
+        const nowMs = Date.now();
+        if (note !== lastFailNote || nowMs - lastFailAt >= 10000) {
+          lastFailNote = note;
+          lastFailAt = nowMs;
+          // 单句翻译失败时这一句不会上屏译文，ASR 已上屏的日语原文会残留——
+          // 这是实时链路"中日掺杂"最常见的根因，必须带上原文才能定位是哪句。
+          pushLog('warn', `[translate/realtime] 单句${job.final ? '定稿' : '草稿'}翻译失败（跳过该句，链路继续）` +
+            `：${note} · 原文：${clip(job.row.content, 40)}`);
+        }
+        onError?.(note);
+      }
+    }
+  }
+  function pump() {
+    if (inflight) return inflight;
+    if (stopped) return Promise.resolve();
+    inflight = drain().finally(() => {
+      inflight = null;
+      if (!stopped && (finals.length || preview)) void pump();
+    });
+    return inflight;
+  }
+  function clearPreview(id) {
+    if (finalized.has(id)) return; // 保留已翻草稿，等对应定稿替换。
+    if (id) versions.set(id, (versions.get(id) || 0) + 1);
+    else for (const key of versions.keys()) if (!finalized.has(key)) versions.set(key, versions.get(key) + 1);
+    if (!id || preview?.id === id) preview = null;
+    if (!id || session.previewSegment?.id === id) {
+      session.previewSegment = null;
+      void queueLiveMessage(session, { type: 'BSCG_LIVE_PREVIEW_CLEAR', previewId: id || '' });
+    }
+  }
+  pushLog('info', `[translate] 实时${config.finalOnly ? '仅定稿' : '草稿/定稿'}翻译已启用 mode=${config.mode} model=${config.model} source=${config.sourceLanguage} target=${config.targetLanguage} display=${config.displayMode}`);
+  return {
+    preview: row => enqueueCue(row), final: row => enqueueCue(row, true), clearPreview,
+    enqueue: rows => rows.forEach(row => enqueueCue(row, true)),
+    pushBacklog: rows => rows.forEach(row => enqueueCue(row, true, true)),
+    tick: () => {},
+    seek: () => {
+      displayEpoch++;
+      newestCueFrom = -Infinity;
+      displayedOrder = 0;
+      clearPreview();
+      lastDraftText.clear();
+      draftRuns.clear();
+      session.finalSegment = null;
+    },
+    finish: async () => {
+      while (!stopped && (inflight || finals.length || preview)) await Promise.race([pump(), cancelled]);
+      // 汇总一条：实时链路按句翻译，只有总数和 P95 才能反映"跟不跟得上播放"。
+      pushLog('info', `[translate/realtime] 实时翻译结束：已翻 ${translated} 句 · 请求 P95 ${latencyP95(latencies)}ms`);
+    },
+    cancel: () => {
+      const dropped = finals.length + Number(Boolean(preview));
+      stopped = true;
+      if (!requestController.signal.aborted) requestController.abort('translation-cancelled');
+      preview = null; finals.length = 0; resolveCancelled();
+      // 拖动、改设置、会话结束都会走到这里，丢掉的是"还没翻完的句子"：
+      // 排查"拖动后字幕短暂空白"时先看这条，再看其后是否重新入队。
+      if (dropped) pushLog('info', `[translate/realtime] 已丢弃 ${dropped} 个在途/排队单句（设置变更、拖动或会话结束）`);
+    },
+    isStopped: () => stopped,
+    stats: () => ({ translated, lastLatencyMs, queued: finals.length + Number(Boolean(preview)),
+      latencyP95Ms: latencies.length ? latencies.slice().sort((a, b) => a - b)[Math.ceil(latencies.length * .95) - 1] : 0 })
+  };
+}
+
+// 翻译失败必须分两类处理，否则一次抽风会带走整场翻译：
+//   内容级——模型对这批文本本身处理失败：把多行并成一行、吐空行、复述提示词被质量检查拦下。
+//             本地小模型（如 Hy-MT2-1.8B）上是高频行为，值得重试或拆小。
+//   传输级——服务不可用、请求超时、HTTP 错误。重试只会再白等一轮 240 秒超时，必须熔断止损。
+// 只按文案判定：这些错误串全部由本仓库自己产生（translate.js 与 translateWithConfiguredModel），
+// 不依赖每个后端都回传同一个标记位，改动面最小。
+const CONTENT_TRANSLATE_FAILURE = /行数不匹配|数量或类型无效|模型返回空译文|模型未返回单句译文|翻译质量|达到长度上限/;
+function isContentTranslateFailure(error) {
+  return CONTENT_TRANSLATE_FAILURE.test(String(error?.message || error || ''));
+}
+
+function startBrowserDirectTranslator(session, settings, onError) {
+  let config = translateActiveConfig(settings);
   if (!translateIsReady(config)) return null;
-  // 一次起码送 200 字：优先凑够 MIN_BATCH_CHARACTERS 再发，上限 24 行 / 900 字
-  // 兜住超长批。字幕单行上限 18 字，10 行的旧上限最多只有 180 字，永远到不了 200。
-  const BATCH_MIN_CHARACTERS = 200;
-  const BATCH_MAX_LINES = 24;
-  const BATCH_MAX_CHARACTERS = 900;
-  const IDLE_FLUSH_MS = 700;
+  if (session.mode === 'browser-capture') return startRealtimeCaptionTranslator(session, {
+    ...config, finalOnly: false, sourceLanguage: session.settings?.asrProfile === 'qwen3_asr_0_6b' ? 'auto' : (session.settings?.asrLanguage || 'auto')
+  }, onError);
+  const requestController = new AbortController();
+  config = { ...config, abortSignal: requestController.signal };
+  // API 优先凑够 200 字，上限 24 行 / 900 字；ONNX 使用小批次降低首句等待。
+  // Local autoregressive GPU translation favors short jobs; API batching keeps
+  // its existing throughput policy. Near the playhead, publish one GPU row first.
+  const BATCH_MIN_CHARACTERS = config.mode === 'onnx' ? 48 : 200;
+  const BATCH_MAX_LINES = config.mode === 'onnx' ? 4 : 24;
+  const BATCH_MAX_CHARACTERS = config.mode === 'onnx' ? 240 : 900;
+  const IDLE_FLUSH_MS = config.mode === 'onnx' ? 40 : 700;
   // 领先播放头不足这个秒数就立刻上屏识别原文，避免用户拖到已识别区域时字幕空着。
   const DISPLAY_LEAD_SECONDS = 3;
+  // 日志对照用：把单行截断到固定长度，避免一批日志撑爆 pushLog 的 600 字符上限。
+  // 中日文都是宽字符，30 字足够辨别语义；空白合并防止换行把对照拆散。
+  const clip = (s, n = 30) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, n);
+  // 批次进度日志的节流窗口。一部长片会有成百上千批，逐批记录会在十几分钟内
+  // 冲掉 600 条的会话缓冲、把真正的错误挤走；所以常规进度按 10 秒记一条，
+  // 只有"领先量不足"这种需要排查的时刻才无视节流立即记录。
+  const PROGRESS_LOG_INTERVAL_MS = 10000;
   const displayMode = config.displayMode === 'bilingual' ? 'bilingual' : 'translated';
   const pending = [];
   const queuedKeys = new Set();
   const heldRows = [];
-  const requestController = new AbortController();
   let inflight = null;
   let idleTimer = null;
   let stopped = false;
@@ -4473,10 +5308,35 @@ function startBrowserDirectTranslator(session, settings, onError) {
   let deferred = 0;
   let fallback = 0;
   let failure = '';
+  let activeBatch = [];
+  let lastLatencyMs = 0;
+  const latencies = [];
+  let lastProgressLogAt = 0;
+  let resolveCancelled;
+  const cancelled = new Promise(resolve => { resolveCancelled = resolve; });
 
   const rowKey = (row) => `${Number(row.from).toFixed(3)}\n${Number(row.to).toFixed(3)}\n${String(row.content)}`;
   const rowCharacters = (row) => Array.from(String(row.content || '')).length;
   const batchCharacters = (batch) => batch.reduce((sum, row) => sum + rowCharacters(row), 0);
+
+  function updateWatermark() {
+    const progress = session.lookaheadMetrics ||= { anchor: Number(session.currentVideoTime) || 0 };
+    const anchor = Number(progress.anchor) || 0;
+    const recognized = Math.max(anchor, Number(progress.recognizedTo) || 0);
+    let contiguous = recognized;
+    for (const rows of [pending, activeBatch]) for (const row of rows) {
+      if (row.to > anchor) contiguous = Math.min(contiguous, Math.max(anchor, row.from));
+    }
+    progress.translatedContiguousTo = stopped ? anchor : Math.max(anchor, contiguous);
+    progress.translationAheadSeconds = Math.max(0, progress.translatedContiguousTo - (Number(session.currentVideoTime) || 0));
+    return progress;
+  }
+
+  function prioritizePending() {
+    const position = Number(session.currentVideoTime) || 0;
+    const priority = row => row.to >= position ? Math.max(0, row.from - position) : 1e9 + position - row.to;
+    pending.sort((a, b) => priority(a) - priority(b));
+  }
 
   // 播放位置一直在动，用会话上的实时值判断"这批是不是还在播放头前面"。
   // 传了 row 就按这一行自己的起始时间算；否则以队首（最早压着的行）为锚点。
@@ -4488,7 +5348,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
 
   // 领先量够 → 压着等译文；不够 → 立刻按识别原文上屏，不能留空。
   function shouldHold(row = null) {
-    return aheadSeconds(row) >= DISPLAY_LEAD_SECONDS;
+    return displayMode === 'translated' || aheadSeconds(row) >= DISPLAY_LEAD_SECONDS;
   }
 
   // 把压着的行按识别原文落地。shouldKeep 返回 true 的行继续等译文，
@@ -4503,17 +5363,31 @@ function startBrowserDirectTranslator(session, settings, onError) {
     heldRows.length = 0;
     heldRows.push(...keep);
     for (const row of drop) {
-      emitCaptionRow(session, row);
+      if (displayMode !== 'translated') emitCaptionRow(session, row);
       fallback += 1;
+    }
+    // 降级是"翻译没跟上播放"的直接证据。只在实际发生降级时记一条，并带上当时的
+    // 领先量：领先为负 = 播放头追上了译文（正常但需关注）；领先仍为正 = 翻译失败
+    // 或已中止（才是异常）。tick() 会频繁调用本函数，但 drop 为空时不产生日志。
+    if (drop.length) {
+      // 降级是"中日掺杂"最直接的来源：压着的日语原文被播放头追平后直接上屏，
+      // 与已上屏的中文译文交替出现。带上原文才能定位是哪段追上了播放。
+      pushLog('warn', `[translate] ${drop.length} 行不再等待译文` +
+        `（${displayMode === 'translated' ? '仅译文模式不显示原文' : '已按识别原文上屏'}）· ` +
+        `累计降级 ${fallback} 行 · 当时领先 ${aheadSeconds().toFixed(1)}s · ` +
+        `原文：${drop.slice(0, 4).map((r) => clip(r.content)).join(' | ')}` +
+        (drop.length > 4 ? ' …' : ''));
     }
     return drop.length;
   }
 
-  // 失败只报一次并停掉翻译：字幕必须继续按识别原文走完，不能整条链路卡死。
+  // 熔断：只在"翻译服务本身不可用"（超时 / HTTP 错误 / 逐行重试也撞上传输级错误）时调用。
+  // 内容级失败已在 drain() 里逐行兜底，不再走到这里——否则一批抽风就会让整场字幕
+  // 从那一刻起全部退回识别原文，而界面上只留一句"稍后自动继续"，永远等不到。
+  // 熔断后字幕按识别原文继续走完，heldRows 里压着的行必须立刻落地。
   function abort(error) {
     if (stopped) return;
     stopped = true;
-    if (!requestController.signal.aborted) requestController.abort(error || 'translation-stopped');
     failure = String(error || '未知错误');
     pending.length = 0;
     if (idleTimer) {
@@ -4521,7 +5395,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
       idleTimer = null;
     }
     flushHeldAsRecognized();
-    pushLog('warn', `[translate] 前瞻字幕翻译中止，改显示识别原文：${failure}`);
+    pushLog('warn', `[translate] 前瞻字幕翻译中止，${displayMode === 'translated' ? '仅译文模式不显示原文' : '改显示识别原文'}：${failure}`);
     onError?.(failure);
   }
 
@@ -4534,46 +5408,134 @@ function startBrowserDirectTranslator(session, settings, onError) {
   }
 
   async function translateBatch(batch) {
-    const result = await translateLines(config, batch.map((row) => row.content), requestController.signal);
+    const began = Date.now();
+    const result = await BSCG_TRANSLATE.translateWithQualityRetry(config, batch.map((row) => row.content),
+      translateWithConfiguredModel, issue => pushLog('warn', `[translate/quality] ${issue}`), () => stopped);
+    lastLatencyMs = Date.now() - began;
+    latencies.push(lastLatencyMs);
+    if (latencies.length > 20) latencies.shift();
     if (!result.ok) throw new Error(result.error || '翻译请求失败');
     return batch.map((row, index) => {
       const text = cleanDisplayCaption(result.texts[index]);
       // 模型对噪声行返回空行时保留识别原文，宁可显示原文也不留空白。
-      if (!text) return { from: row.from, to: row.to, content: row.content };
+      if (!text) throw new Error('模型返回空译文');
       return displayMode === 'bilingual'
-        ? { from: row.from, to: row.to, content: text, sourceContent: row.content }
-        : { from: row.from, to: row.to, content: text };
+        ? { from: row.from, to: row.to, content: text, sourceContent: row.content, translationVerified: true }
+        : { from: row.from, to: row.to, content: text, translationVerified: true };
     });
+  }
+
+  // 内容级失败不熔断。整批重发会得到同样的合并结果，没有意义；按行拆开单独请求
+  // 才是结构性可靠的退路——translateLines 收到单行时 parseTranslatedLines 走
+  // expectedCount <= 1 分支，模型把整段当一条，逻辑上不可能再出现"行数不匹配"。
+  // 单行仍翻不出来的只丢这一行（按识别原文落地，与 flushHeldAsRecognized 同口径），
+  // 不牵连同批其余行。返回 null 表示撞上传输级错误，调用方必须熔断。
+  async function recoverBatchLineByLine(batch) {
+    const began = Date.now();
+    const recovered = [];
+    const pairs = [];
+    for (const row of batch) {
+      if (stopped) return null;
+      let single;
+      try {
+        single = await translateBatch([row]);
+      } catch (error) {
+        if (!isContentTranslateFailure(error)) return null;
+        pushLog('warn', `[translate] 单行重试仍失败，按识别原文显示：${clip(row.content)} · ${error?.message || String(error)}`);
+        // 仅译文模式不泄漏原文，与 flushHeldAsRecognized 的降级口径保持一致。
+        if (displayMode !== 'translated') emitCaptionRow(session, row);
+        fallback += 1;
+        continue;
+      }
+      recovered.push(...single);
+      if (pairs.length < 4) pairs.push(`[原]${clip(row.content)}→[译]${clip(single[0]?.content)}`);
+    }
+    // 一行都没救回来：说明这批内容模型整体处理不了，再往下拖只会让字幕越落越远。
+    if (!recovered.length) return null;
+    pushLog('info', `[translate] 逐行恢复：本批 ${batch.length} 行 → 成功 ${recovered.length} 行 · ${Date.now() - began}ms` +
+      (pairs.length ? `：${pairs.join(' | ')}` : '') + (batch.length > 4 ? ' …' : ''));
+    return recovered;
   }
 
   async function drain() {
     while (pending.length && !stopped) {
+      prioritizePending();
       const batch = [];
       let characters = 0;
-      // 凑到 200 字就发；队列见底时把剩下的照样发出去，免得尾行卡到收尾才出。
-      while (pending.length && batch.length < BATCH_MAX_LINES) {
-        const next = pending[0];
+      const position = Number(session.currentVideoTime) || 0;
+      const urgent = config.mode === 'onnx' && pending[0].to >= position && pending[0].from - position <= 8;
+      const batchLimit = urgent ? 1 : BATCH_MAX_LINES;
+      // 达到当前后端的批次目标就发；队列见底时也发送尾行。
+      while (batch.length < pending.length && batch.length < batchLimit) {
+        const next = pending[batch.length];
         const size = rowCharacters(next);
         if (batch.length && characters + size > BATCH_MAX_CHARACTERS) break;
-        batch.push(pending.shift());
+        batch.push(next);
         characters += size;
         if (characters >= BATCH_MIN_CHARACTERS) break;
       }
       if (!batch.length) break;
+      pending.splice(0, batch.length);
+      activeBatch = batch;
+      updateWatermark();
       let output;
+      let recoveredIndividually = false;
       try {
         output = await translateBatch(batch);
       } catch (error) {
-        abort(error?.message || String(error));
-        return;
+        const message = error?.message || String(error);
+        // 翻译失败若触发 abort，那条日志不带原文。补一条本批原文，
+        // 排查"中日掺杂"时能定位是哪批日语没翻成中文而残留上屏。
+        pushLog('warn', `[translate] 本批 ${batch.length} 行翻译失败，原文：` +
+          batch.slice(0, 4).map((r) => clip(r.content)).join(' | ') +
+          (batch.length > 4 ? ' …' : ''));
+        // 只有传输级错误才熔断。内容级错误仅说明"这一批文本模型没处理好"，
+        // 拆成单行重试继续，绝不能让一批抽风带走整场翻译。
+        if (!isContentTranslateFailure(error)) {
+          abort(message);
+          return;
+        }
+        output = await recoverBatchLineByLine(batch);
+        if (!output) {
+          abort(message);
+          return;
+        }
+        recoveredIndividually = true;
       }
       if (stopped) return;
+      // 【对照日志】排查"中日掺杂"的核心观测点：每批原文→译文一目了然。
+      // 每行截断 30 字、最多前 4 行，单条 < 600 字符上限。
+      // 逐行恢复过的批次行数与原文不再一一对应，对照已由 recoverBatchLineByLine 记过。
+      if (!recoveredIndividually) {
+        pushLog('info', `[translate] 本批 ${batch.length} 行 ${lastLatencyMs}ms：` +
+          batch.slice(0, 4).map((r, i) => `[原]${clip(r.content)}→[译]${clip(output[i]?.content)}`).join(' | ') +
+          (batch.length > 4 ? ' …' : ''));
+      }
+      // Remove completed held rows in one linear pass, by identity. Repeated
+      // findIndex/splice scans were O(batch * held), and equal timestamps could
+      // remove a different cue that was still waiting for translation.
+      const completed = new Set(batch);
+      let heldWrite = 0;
+      for (const row of heldRows) if (!completed.has(row)) heldRows[heldWrite++] = row;
+      heldRows.length = heldWrite;
       // 一次请求里的行必须整体落屏：只落地一部分会让后面的行错位。
       for (const row of output) {
-        const index = heldRows.findIndex((held) => Math.abs(held.from - row.from) < 0.05);
-        if (index >= 0) heldRows.splice(index, 1);
         emitCaptionRow(session, row);
         translated += 1;
+      }
+      activeBatch = [];
+      const watermark = updateWatermark();
+      // 【关键观测点】译文领先量 = 已完成连续译文 − 播放头。
+      //   领先 > 0：字幕在"预见"播放，用户直接看到译文；
+      //   领先 ≤ 0：翻译没追上，字幕退回识别原文（fallback 同步上涨）。
+      // 首批必记（确认翻译链路真的通了），领先不足必记（这才是要排查的时刻），
+      // 其余按 PROGRESS_LOG_INTERVAL_MS 节流，避免把真正的错误刷出缓冲区。
+      const ahead = Number(watermark.translationAheadSeconds) || 0;
+      const now = Date.now();
+      if (translated === output.length || ahead < DISPLAY_LEAD_SECONDS || now - lastProgressLogAt >= PROGRESS_LOG_INTERVAL_MS) {
+        lastProgressLogAt = now;
+        pushLog(ahead < 0 ? 'warn' : 'info', `[translate] 已翻 ${translated} 行 · 译文领先 ${ahead.toFixed(1)}s · ` +
+          `待译 ${pending.length} 压着 ${heldRows.length} · 本批 ${output.length} 行 ${lastLatencyMs}ms`);
       }
     }
   }
@@ -4601,6 +5563,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
         sourceContent: String(row.sourceContent || '')
       };
       const key = rowKey(normalized);
+      if (session.translationRows?.has(captionTranslationKey(normalized))) continue;
       if (queuedKeys.has(key)) continue;
       queuedKeys.add(key);
       // 压着等译文的前提是这一行确实在播放头前面；被追平的行必须马上上屏。
@@ -4615,7 +5578,10 @@ function startBrowserDirectTranslator(session, settings, onError) {
     }
     if (held) deferred += held;
     if (!pending.length) return;
-    if (batchCharacters(pending) >= BATCH_MIN_CHARACTERS || pending.length >= BATCH_MAX_LINES) void pump();
+    updateWatermark();
+    const position = Number(session.currentVideoTime) || 0;
+    if (pending.some(row => row.to >= position && row.from - position <= 8) ||
+      batchCharacters(pending) >= BATCH_MIN_CHARACTERS || pending.length >= BATCH_MAX_LINES) void pump();
     else scheduleIdleFlush();
   }
 
@@ -4627,6 +5593,7 @@ function startBrowserDirectTranslator(session, settings, onError) {
     for (const row of Array.isArray(rows) ? rows : []) {
       if (!row?.content) continue;
       const key = rowKey(row);
+      if (session.translationRows?.has(captionTranslationKey(row))) continue;
       if (queuedKeys.has(key)) continue;
       queuedKeys.add(key);
       backlog.push({
@@ -4638,13 +5605,17 @@ function startBrowserDirectTranslator(session, settings, onError) {
     }
     if (!backlog.length) return;
     pending.unshift(...backlog);
+    pushLog('info', `[translate] 回填 ${backlog.length} 行已有字幕优先翻译（队列 ${pending.length}）`);
     void pump();
   }
 
   // 播放位置变化时的兜底：快进/回拖把播放头推过了某一行，那一行就不能再等译文。
   function tick() {
-    if (stopped || !heldRows.length) return;
+    if (stopped) return;
     flushHeldAsRecognized((row) => shouldHold(row));
+    const position = Number(session.currentVideoTime) || 0;
+    if (pending.some(row => row.to >= position && row.from - position <= 8)) void pump();
+    updateWatermark();
   }
 
   // 收尾：把在途批次与剩余队列全部翻完（失败的按识别原文落地），调用方随后读
@@ -4654,30 +5625,46 @@ function startBrowserDirectTranslator(session, settings, onError) {
       clearTimeout(idleTimer);
       idleTimer = null;
     }
-    while (pending.length || inflight) {
-      await pump();
+    while (!stopped && (pending.length || inflight)) {
+      await Promise.race([pump(), cancelled]);
       if (!pending.length && !inflight) break;
     }
     if (!stopped && heldRows.length) {
       // 全部翻完仍压着的行：队列已空说明这些行模型没返回，按原文兜底。
       flushHeldAsRecognized();
     }
+    // 收尾汇总：一次会话只记一条，回答"这趟到底翻了多少、压后多久、降级几次"。
+    // 排查时先看这条，再往上找第一条 [translate] 领先告警，就能定位卡在哪一批。
+    const p95 = latencies.length ? latencies.slice().sort((a, b) => a - b)[Math.min(latencies.length - 1, Math.ceil(latencies.length * .95) - 1)] : 0;
+    pushLog(fallback ? 'warn' : 'info', `[translate] 前瞻翻译结束：已翻 ${translated} 行 · ` +
+      `压后显示 ${deferred} 行 · 降级 ${fallback} 行 · ${stopped ? '曾中止' : '正常收尾'} · 请求 P95 ${p95}ms`);
   }
 
   pushLog('info', `[translate] 前瞻字幕翻译已启用 mode=${config.mode} endpoint=${config.baseUrl} ` +
     `model=${config.model} target=${config.targetLanguage} display=${displayMode} ` +
-    `（仅音轨整轨前瞻生效，领先 ≥${DISPLAY_LEAD_SECONDS}s 直接显示译文）`);
+    `（仅译文模式等待译文；实时捕获只翻译识别定稿）`);
   return {
     enqueue,
     pushBacklog,
     tick,
     finish,
-    abort,
+    cancel: () => {
+      stopped = true;
+      if (!requestController.signal.aborted) requestController.abort('translation-cancelled');
+      resolveCancelled();
+      pending.length = 0;
+      heldRows.length = 0;
+      activeBatch = [];
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = null;
+    },
     // 调用方要据此决定"还能不能延后显示"：一旦中止就必须立刻走识别原文上屏，
     // 否则延后的行永远不会被发出去，字幕会整段空白。用方法而非 getter，
     // 避免调用方解构后拿到一次性快照。
     isStopped: () => stopped,
-    stats: () => ({ translated, deferred, fallback, failure, queued: pending.length, held: heldRows.length })
+    stats: () => ({ translated, deferred, fallback, failure, queued: pending.length, held: heldRows.length,
+      ...updateWatermark(), lastLatencyMs,
+      latencyP95Ms: latencies.length ? latencies.slice().sort((a, b) => a - b)[Math.ceil(latencies.length * .95) - 1] : 0 })
   };
 }
 
@@ -4687,9 +5674,17 @@ function startBrowserDirectTranslator(session, settings, onError) {
 function publishTranslatedCaptionSegment(session, recognizedSegment, flush = true) {
   const translator = session.translator;
   // 中止后不能再延后：翻译队列已经停摆，压着的行永远等不到译文。
-  const deferDisplay = Boolean(translator && !translator.isStopped());
+  const config = translateActiveConfig(session.settings);
+  const deferDisplay = Boolean(translator && !translator.isStopped()) || (config.enabled && config.displayMode === 'translated');
   const published = publishRecognizedSegment(session, recognizedSegment, { bufferedTo: session.bufferedTo }, flush, deferDisplay);
-  if (deferDisplay && published.length) translator.enqueue(published);
+  session.originalCaptionRows ||= new Map();
+  for (const row of published) session.originalCaptionRows.set(Number(row.from).toFixed(3), {
+    from: row.from, to: row.to, content: row.content
+  });
+  session.lookaheadMetrics ||= { anchor: Number(session.currentVideoTime) || 0 };
+  session.lookaheadMetrics.recognizedTo = Math.max(Number(session.lookaheadMetrics.recognizedTo) || 0,
+    ...published.map(row => Number(row.to) || 0));
+  if (translator && !translator.isStopped() && published.length) translator.enqueue(published);
   return published;
 }
 
@@ -4701,8 +5696,8 @@ function liveCapturePolicy(pageUrl, clock = null, options = {}) {
   const huyaRoom = huya && /^\/[\w-]+\/?$/.test(url.pathname) &&
     !/^\/(?:g|l|s|download|search|category|index|my)\/?$/i.test(url.pathname);
   const tabAudio = options.captureMode === 'tab';
-  const isLive = Boolean(tabAudio || roomId || huyaRoom || clock?.isLive ||
-    (clock?.kind && !clock.paused && !clock.duration));
+  // 时长暂未加载不代表直播；未知 VOD 仍应先尝试清单前瞻。
+  const isLive = Boolean(tabAudio || roomId || huyaRoom || clock?.isLive);
   return {
     isLive, roomId, directory: biliLive && !roomId && !tabAudio,
     overlayOnTop: tabAudio,
@@ -4752,10 +5747,7 @@ async function prepareBrowserDirectSource(tab, message = {}) {
     const videoId = url.searchParams.get('v') || url.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
     if (!videoId) return null;
     const state = await getYouTubePlayerState(tab.id, videoId);
-    const candidates = (state.audioFormats || []).filter((format) => format.url).map((format) => ({
-      url: format.url, kind: 'file', frameId: 0,
-      mimeType: format.mimeType || '', bitrate: Number(format.bitrate) || 0
-    }));
+    const candidates = youTubeReplayCandidates(state);
     return candidates.length ? {
       platform: 'youtube', videoId, partId: videoId, title: state.title || tab.title,
       duration: Number(state.lengthSeconds) || 0, candidates
@@ -4763,26 +5755,17 @@ async function prepareBrowserDirectSource(tab, message = {}) {
   }
   if (/^file:/i.test(tab.url || '')) return null;
   const generic = await getGenericMediaSource(tab.id).catch(() => null);
+  if (!generic) return null;
   const observed = (await getObservedMediaRecords(tab.id)).slice().reverse();
-  const candidates = [];
-  const addCandidate = (url, kind, frameId = 0, extra = {}) => {
-    if (!/^https?:/i.test(String(url || '')) || candidates.some((candidate) => candidate.url === url)) return;
-    candidates.push({ url, kind, frameId: Math.max(0, Number(frameId) || 0), ...extra });
-  };
-  if (generic?.mediaUrl && !/^blob:/i.test(generic.mediaUrl)) {
-    addCandidate(generic.mediaUrl, generic.manifest || /\.m3u8(?:$|[?#])/i.test(generic.mediaUrl) ? 'hls' : 'file', generic.frameId);
-  }
-  for (const entry of observed) {
-    if (!['hls', 'media'].includes(entry.kind)) continue;
-    addCandidate(entry.url, entry.kind === 'hls' ? 'hls' : 'file', entry.frameId, {
-      mimeType: entry.mimeType || '', bitrate: Number(entry.bitrate) || 0
-    });
-  }
+  const candidates = genericReplayCandidates(generic, observed);
   if (!candidates.length) return null;
   const identity = await sourceHash(tab.url);
   return {
     platform: 'web', videoId: identity, partId: identity,
     title: tab.title || generic?.title || '在线视频', duration: Number(generic?.duration) || 0,
+    referer: generic.referer || tab.url,
+    frameId: generic.frameId,
+    playerMediaSrc: generic.mediaSrc || '',
     candidates
   };
 }
@@ -4790,7 +5773,8 @@ async function prepareBrowserDirectSource(tab, message = {}) {
 async function startBrowserDirectLive(tab, settings, source, borrowTask = null, startRequest = {}) {
   const clock = await getVideoClock(tab.id);
   const cached = await latestResultForTab(tab.id, tab.url).catch(() => null);
-  const cachedRows = Array.isArray(cached?.segments) ? cached.segments.map((row) => ({ ...row, content: cleanDisplayCaption(row.content) })).filter((row) => row.content) : [];
+  const cachedOriginals = cached?.originalSegments || cached?.segments;
+  const cachedRows = Array.isArray(cachedOriginals) ? cachedOriginals.map((row) => ({ ...row, content: cleanDisplayCaption(row.content) })).filter((row) => row.content) : [];
   const seededRows = cachedRows.concat(borrowedTaskRows(borrowTask)).sort((a, b) => a.from - b.from).slice(-MAX_LIVE_ROWS);
   await injectLiveOverlay(tab.id);
   if (!await isLiveStartCurrent(tab.id, startRequest)) return { ok: true, superseded: true };
@@ -4808,35 +5792,21 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
     documentId: currentDocumentId(tab.id), settings,
     rows: seededRows, displayPending: null, bufferedTo: 0,
     currentVideoTime: clock.currentTime, playbackRate: clock.playbackRate, paused: clock.paused,
+    directCoverageStart: clock.currentTime,
     fullTrack: clock.currentTime <= 1,
     finished: false, stopRequested: false,
     browserControl: { abort: null, engineSessionId: '', pendingSeekTime: clock.currentTime }
   };
   liveCaptures.set(tab.id, session);
   attachBorrowedTask(session, borrowTask);
-  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: 'timeline', segments: seededRows });
-  // 前瞻字幕（音轨整轨识别）专用翻译队列：识别文本先原样上屏，攒批送本地/远程
-  // 模型，译文就绪后按同一时间轴原地覆盖。未启用/未配置时 translator 为 null，
-  // publishCaptionSegment 退化为原来的直接发布，行为与旧版一致。
-  session.translator = startBrowserDirectTranslator(session, settings, (error) => {
-    void queueLiveMessage(session, { type: 'BSCG_LIVE_PROGRESS', text: `翻译失败（${String(error || '').slice(0, 80)}）；已显示识别原文` });
-  });
-  session.publishCaptionSegment = (segment) => {
-    session.bufferedTo = Math.max(Number(session.bufferedTo) || 0, Number(segment?.to) || 0);
-    publishTranslatedCaptionSegment(session, segment);
-  };
-  if (session.translator && seededRows.length) {
-    // 整轨缓存行只翻译播放位置附近 + 末尾若干行（远端历史价值低），
-    // 其余随前瞻重新识别后自然换成译文。
-    const anchor = Number(session.currentVideoTime) || 0;
-    const near = seededRows.filter((row) => Math.abs(Number(row.from) - anchor) < 120);
-    session.translator.pushBacklog(near.concat(seededRows.slice(-8)));
-  }
+  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: 'timeline', segments: translateActiveConfig(settings).enabled ? [] : seededRows });
+  configureSessionTranslator(session, settings);
   const request = {
     tabId: tab.id,
     asrProfile: settings.asrProfile || DEFAULTS.asrProfile,
     backendMode: browserBackendMode(settings),
     cpuThreads: Number(settings.recognitionThreads) || 0,
+    asrLanguage: settings.asrLanguage || 'auto',
     voiceEnhance: Boolean(settings.voiceEnhance),
     voiceEnhancePreset: settings.voiceEnhancePreset || 'balanced',
     title: session.title,
@@ -4845,6 +5815,8 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
     documentId: session.documentId,
     jobId: session.sessionId,
     startTime: clock.currentTime,
+    rollingLookahead: true,
+    initialClock: clock,
     allowScan: false,
     directSource: {
       platform: source.platform || 'web',
@@ -4853,11 +5825,20 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
       duration: Number(source.duration) || 0,
       bitrate: Number(source.bitrate) || 0,
       referer: source.referer || '',
+      playerMediaSrc: source.playerMediaSrc || '', frameId: Number(source.frameId) || 0,
       candidates: source.candidates
     }
   };
   void browserTranscribeRequest(request, (event) => {
     if (session.finished) return;
+    if (event.metrics) {
+      const metrics = event.metrics;
+      session.lookaheadMetrics ||= { anchor: Number(session.currentVideoTime) || 0 };
+      for (const key of ['fetchedTo', 'decodedTo', 'recognizedTo', 'targetAheadSeconds', 'hlsCacheBytes', 'decodedPcmBytes']) {
+        if (Number.isFinite(metrics[key])) session.lookaheadMetrics[key] = metrics[key];
+      }
+      session.translator?.stats?.();
+    }
     if (event.type === 'queue') {
       void queueLiveMessage(session, {
         type: 'BSCG_LIVE_QUEUED',
@@ -4867,7 +5848,7 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
         queueBlocker: String(event.queueBlocker || '')
       });
     } else if (event.type === 'segments_reset') {
-      session.rows = seededRows.slice();
+      session.rows = translateActiveConfig(session.settings).enabled ? [] : seededRows.slice();
       session.displayPending = null;
       session.bufferedTo = 0;
       void queueLiveMessage(session, { type: 'BSCG_LIVE_INVALIDATE_RANGE', from: 0, to: Number.MAX_SAFE_INTEGER });
@@ -4894,11 +5875,11 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
     }
     void (async () => {
       const diagnostics = error?.metrics || {};
-      session.translator?.abort?.('整轨直取失败，切换实时取音');
       pushLog('warn', `[${source.platform || 'web'}/direct] 整轨直取失败，候选=${source.candidates?.length || 0} ` +
         `探测=${Number(diagnostics.directProbesStarted) || 0} 下载=${Number(diagnostics.directCandidatesTried) || 0} ` +
         `最后=${diagnostics.lastAudioCandidate || 'unknown'}；切换实时取音：${error?.message || error}`);
       const retainedRows = session.rows.slice();
+      session.translator?.cancel?.();
       session.finished = true;
       releaseBorrowedTask(session);
       await controlBrowserLiveMedia(session, 'resume').catch(() => {});
@@ -4921,7 +5902,7 @@ async function startBrowserDirectLive(tab, settings, source, borrowTask = null, 
     sessionId: session.sessionId,
     mode: 'timeline',
     aheadSeconds: BROWSER_DIRECT_LEAD_SECONDS,
-    segments: seededRows,
+    segments: translateActiveConfig(settings).enabled ? [] : seededRows,
     queued: Number(session.browserControl.queueAhead) > 0,
     queuePosition: Number(session.browserControl.queuePosition) || 0,
     queueAhead: Number(session.browserControl.queueAhead) || 0,
@@ -4934,8 +5915,9 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
   const policy = options.policy || liveCapturePolicy(tab.url, clock);
   const cached = policy.isLive ? null : await latestResultForTab(tab.id, tab.url).catch(() => null);
   if (policy.isLive) { borrowTask = null; initialRows = []; }
-  const cachedRows = Array.isArray(cached?.segments)
-    ? cached.segments.map((row) => ({ ...row, content: cleanDisplayCaption(row.content) })).filter((row) => row.content)
+  const cachedOriginals = cached?.originalSegments || cached?.segments;
+  const cachedRows = Array.isArray(cachedOriginals)
+    ? cachedOriginals.map((row) => ({ ...row, content: cleanDisplayCaption(row.content) })).filter((row) => row.content)
     : [];
   const seededRows = cachedRows.concat(borrowedTaskRows(borrowTask), initialRows || [])
     .sort((a, b) => Number(a.from) - Number(b.from))
@@ -4978,7 +5960,8 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
   };
   liveCaptures.set(tab.id, session);
   attachBorrowedTask(session, borrowTask);
-  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: policy.isLive ? 'live' : 'capture', overlayOnTop: Boolean(policy.overlayOnTop), segments: seededRows });
+  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: policy.isLive ? 'live' : 'capture', overlayOnTop: Boolean(policy.overlayOnTop), segments: translateActiveConfig(settings).enabled ? [] : seededRows });
+  configureSessionTranslator(session, settings);
   if (policy.isLive) pushLog('info', `[live] 直播实时字幕 source=${sourcePlatform} room=${policy.roomId || 'generic'}；复用 capture → PCM → ASR 链路`);
   void browserTranscribeRequest({
     tabId: tab.id,
@@ -4987,6 +5970,7 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
     asrProfile: settings.asrProfile || DEFAULTS.asrProfile,
     backendMode: browserBackendMode(settings),
     cpuThreads: Number(settings.recognitionThreads) || 0,
+    asrLanguage: settings.asrLanguage || 'auto',
     voiceEnhance: Boolean(settings.voiceEnhance),
     voiceEnhancePreset: settings.voiceEnhancePreset || 'balanced',
     chunkSeconds: Number(settings.liveChunkSeconds) || SENSEVOICE_LIVE_WINDOW_SECONDS,
@@ -5012,10 +5996,44 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
         queueBlocker: String(event.queueBlocker || '')
       });
     } else if (event.type === 'segment' && event.segment?.content) {
-      publishRecognizedSegment(session, event.segment, { bufferedTo: Number(event.segment.to) || 0 }, true);
+      if (!translateActiveConfig(session.settings).enabled) session.publishCaptionSegment(event.segment);
     } else if (event.type === 'final' && event.segment?.content) {
-      void queueLiveMessage(session, { type: 'BSCG_LIVE_FINAL', segment: event.segment });
+      // 【ASR 定稿观测点】识别侧"草稿→定稿→存储"的定稿一环：断句原因直接回答
+      // "这句话为什么在这里被切开"。max-window=硬窗强切（语义碎片高发）、
+      // silence/strong-silence=静音端点、pause=播放暂停。reason/audioSeconds
+      // 只进日志，剥离后不再向字幕链路（翻译/上屏/导出）传播。
+      const { reason: phraseReason, audioSeconds: phraseAudioSeconds, timing: phraseTiming, timedSegments, ...finalSegment } = event.segment;
+      pushLog('info', `[asr/final] 断句=${phraseReason || 'manual'} ` +
+        `音频=${(Number(phraseAudioSeconds) || 0).toFixed(1)}s id=${finalSegment.id} ` +
+        `timing=${JSON.stringify(phraseTiming || {})} · ${String(finalSegment.content).replace(/\s+/g, ' ').slice(0, 40)}`);
+      session.captureCoverage ||= [];
+      session.captureCoverage.push({ from: finalSegment.from, to: finalSegment.to });
+      session.captureCoverage.sort((a, b) => a.from - b.from);
+      session.captureCoverage = session.captureCoverage.reduce((ranges, range) => {
+          const last = ranges.at(-1);
+          if (last && range.from <= last.to + 0.05) last.to = Math.max(last.to, range.to);
+          else ranges.push({ ...range });
+          return ranges;
+      }, []).slice(-MAX_LIVE_ROWS);
+      if (translateActiveConfig(session.settings).enabled) {
+        session.bufferedTo = Math.max(Number(session.bufferedTo) || 0, Number(finalSegment.to) || 0);
+        // Only acoustic sentence boundaries may split a final. Never distribute
+        // translated characters across the whole capture window.
+        const units = finalCaptionUnits({ ...finalSegment, timedSegments });
+        session.translator?.clearPreview?.(finalSegment.id);
+        units.forEach(row => {
+          if (session.translator && !session.translator.isStopped()) session.translator.final?.(row);
+          else session.originalCaptionRows.set(Number(row.from).toFixed(3), {
+            from: row.from, to: row.to, content: row.content
+          });
+        });
+      }
+      else void queueLiveMessage(session, { type: 'BSCG_LIVE_FINAL', segment: finalSegment });
     } else if (event.type === 'preview' && event.segment?.content) {
+      if (translateActiveConfig(session.settings).enabled) {
+        session.translator?.preview?.(event.segment);
+        return;
+      }
       session.previewSegment = event.segment;
       void queueLiveMessage(session, {
         type: 'BSCG_LIVE_PREVIEW',
@@ -5025,6 +6043,10 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
         segment: event.segment
       });
     } else if (event.type === 'preview-clear') {
+      if (translateActiveConfig(session.settings).enabled) {
+        session.translator?.clearPreview?.(event.previewId);
+        return;
+      }
       if (!event.previewId || session.previewSegment?.id === event.previewId) session.previewSegment = null;
       void queueLiveMessage(session, {
         type: 'BSCG_LIVE_PREVIEW_CLEAR',
@@ -5051,7 +6073,7 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
     ok: true,
     sessionId: session.sessionId,
     mode: policy.isLive ? 'live' : 'capture',
-    segments: seededRows,
+    segments: translateActiveConfig(settings).enabled ? [] : seededRows,
     queued: Number(session.browserControl.queueAhead) > 0,
     queuePosition: Number(session.browserControl.queuePosition) || 0,
     queueAhead: Number(session.browserControl.queueAhead) || 0,
@@ -5080,8 +6102,9 @@ async function startBorrowedBrowserLiveSession(tab, settings, borrowTask) {
   };
   liveCaptures.set(tab.id, session);
   attachBorrowedTask(session, borrowTask);
-  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: 'timeline', segments: seededRows });
+  await sendLive(tab.id, { type: 'BSCG_LIVE_STARTED', sessionId: session.sessionId, mode: 'timeline', segments: translateActiveConfig(settings).enabled ? [] : seededRows });
   await sendLive(tab.id, { type: 'BSCG_LIVE_PROGRESS', text: '正在复用完整转写任务；不会重复启动第二个识别引擎。' });
+  configureSessionTranslator(session, settings);
   session.borrowWatch = setInterval(() => {
     if (session.finished) return;
     if (activeTranscriptions.has(borrowTask.taskId)) return;
@@ -5089,7 +6112,7 @@ async function startBorrowedBrowserLiveSession(tab, settings, borrowTask) {
     session.borrowWatch = 0;
     void finalizeLiveCapture(session, { segments: session.rows });
   }, 800);
-  return { ok: true, sessionId: session.sessionId, mode: 'timeline', borrowed: true, segments: seededRows };
+  return { ok: true, sessionId: session.sessionId, mode: 'timeline', borrowed: true, segments: translateActiveConfig(settings).enabled ? [] : seededRows };
 }
 
 async function handleLiveSeek(tabId, currentTime) {
@@ -5097,8 +6120,25 @@ async function handleLiveSeek(tabId, currentTime) {
   if (!session || session.finished) return { ok: true, ignored: true };
   if (session.isLive) return { ok: true, ignored: true };
   session.currentVideoTime = Math.max(0, currentTime);
+  const recognizedTo = Math.max(Number(session.lookaheadMetrics?.recognizedTo) || 0, Number(session.bufferedTo) || 0);
+  const cachedDirectSeek = session.mode === 'browser-direct' &&
+    session.currentVideoTime >= Number(session.directCoverageStart ?? Infinity) && session.currentVideoTime < recognizedTo;
+  if (session.mode === 'browser-direct' || session.mode === 'browser-capture') {
+    session.translationSeekAnchor = session.currentVideoTime;
+    session.lookaheadMetrics = { anchor: session.currentVideoTime, recognizedTo: cachedDirectSeek ? recognizedTo : session.currentVideoTime,
+      translatedContiguousTo: session.currentVideoTime };
+    if (session.mode === 'browser-capture' && session.translator && !session.translator.isStopped()) {
+      session.translator.seek();
+    } else configureSessionTranslator(session, session.settings);
+  }
   pushLog('info', `[session] 拖动到 ${currentTime.toFixed(1)} 秒 tab=${session.tabId} mode=${session.mode}`);
   if (session.mode === 'browser-direct') {
+    if (cachedDirectSeek) {
+      session.translator?.tick?.();
+      await sendLive(tabId, { type: 'BSCG_LIVE_PROGRESS', text: `已跳转到 ${formatTime(currentTime)}，复用已有字幕并继续预翻译。` });
+      return { ok: true, cached: true };
+    }
+    session.directCoverageStart = session.currentVideoTime;
     session.displayPending = null;
     session.bufferedTo = session.currentVideoTime;
     if (session.currentVideoTime > 1) session.fullTrack = false;
@@ -5112,9 +6152,11 @@ async function handleLiveSeek(tabId, currentTime) {
       });
       return { ok: true, deferred: true };
     }
+    engineSession.directGeneration = (engineSession.directGeneration || 0) + 1;
     const response = await sendToOffscreen({
       type: 'BILI_ASR_DIRECT_SEEK', tabId: session.tabId,
-      sessionId: engineSessionId, currentTime: session.currentVideoTime
+      sessionId: engineSessionId, currentTime: session.currentVideoTime,
+      directGeneration: engineSession.directGeneration
     }).catch((error) => ({ ok: false, error: error?.message || String(error) }));
     if (!response?.ok) {
       pushLog('warn', `[session] 忽略已失效的拖动请求 tab=${session.tabId} engine=${engineSessionId}：${response?.error || '引擎会话已结束'}`);
@@ -5125,13 +6167,18 @@ async function handleLiveSeek(tabId, currentTime) {
     session.fullTrack = false;
     session.displayPending = null;
     session.previewSegment = null;
+    session.finalSegment = null;
     await queueLiveMessage(session, { type: 'BSCG_LIVE_PREVIEW_CLEAR', sessionId: session.sessionId });
+    let cachedThrough = session.currentVideoTime;
+    for (const row of session.captureCoverage?.length ? session.captureCoverage : session.rows) {
+      if (row.from <= cachedThrough + 0.01 && row.to > cachedThrough) cachedThrough = row.to;
+    }
     await sendToOffscreen({
       type: 'BILI_ASR_CLOCK', tabId: session.tabId,
       sessionId: session.browserControl?.engineSessionId || session.sessionId,
       mediaKey: session.mediaKey,
       currentTime: session.currentVideoTime, playbackRate: session.playbackRate, paused: session.paused,
-      seek: true
+      seek: true, cachedThrough
     }).catch(() => null);
   }
   return { ok: true };
@@ -5143,6 +6190,7 @@ async function requestLiveStop(tabId, message = {}) {
   if (!session || session.finished) return { ok: true, ignored: true };
   if (session.stopRequested) return { ok: true, stopping: true };
   session.stopRequested = true;
+  session.translator?.cancel?.();
   pushLog('info', `[session] 用户停止 tab=${session.tabId} mode=${session.mode}`);
   await sendLive(tabId, { type: 'BSCG_LIVE_PROGRESS', text: '正在处理最后一个音频分段…' });
   if (session.mode === 'browser-borrow') {
@@ -5276,11 +6324,15 @@ async function startLiveCaptureNow(tabId, ignoreCache = false, message = {}) {
   if (message.automatic && !tab.active) return { ok: true, superseded: true };
   if (!tab.url && message.pageUrl) tab.url = message.pageUrl;
   if (!/^(https?|file):/i.test(tab.url || '')) throw new Error('当前页面不支持实时字幕');
-  const settings = { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+  const settings = await settingsForVideo(tabId, tab.url, {
+    ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS)))
+  });
   const initialPolicy = liveCapturePolicy(tab.url, null, message);
   if (initialPolicy.directory) throw new Error('请先从直播首页进入具体直播间，开始播放后再点击“字幕”');
   const liveClock = await getVideoClock(tabId).catch(() => null);
   const capturePolicy = liveCapturePolicy(tab.url, liveClock, message);
+  pushLog('info', `[media/route] version=${BG_VERSION} 请求=${message.captureMode || 'video'} ` +
+    `kind=${liveClock?.kind || 'unknown'} 时长=${Number(liveClock?.duration) || 0}s 实时=${capturePolicy.isLive}`);
   if (capturePolicy.isLive) {
     if (!await handoffLiveCaptures(tab, message)) return { ok: true, superseded: true };
     ensureTaskSlot();
@@ -5290,17 +6342,7 @@ async function startLiveCaptureNow(tabId, ignoreCache = false, message = {}) {
   if (!ignoreCache) {
     const cached = await latestResultForTab(tabId, tab.url).catch(() => null);
     if (cached?.segments?.length) {
-      await injectLiveOverlay(tabId);
-      await sendLive(tabId, {
-        type: 'BSCG_LIVE_REUSED',
-        sessionId: `cached:${cached.resultId || cached.createdAt}`,
-        mode: 'capture',
-        rows: cached.segments.length,
-        segments: cached.segments,
-        title: cached.fileName?.replace(/-字幕\.txt$/i, '') || '视频字幕',
-        source: cached.sourceLabel || ''
-      });
-      return { ok: true, sessionId: `cached:${cached.resultId || cached.createdAt}`, mode: 'capture', reused: true, segments: cached.segments, rows: cached.segments.length };
+      return startCachedCaptionSession(tab, settings, cached.originalSegments || cached.segments, cached);
     }
   }
   // 同视频的完整转写正在后台进行（例如刚点过"总结"）：把已生成的分段实时借给
@@ -5319,8 +6361,14 @@ async function startLiveCaptureNow(tabId, ignoreCache = false, message = {}) {
   try {
     const browserSource = await prepareBrowserDirectSource(tab, message);
     if (!await isLiveStartCurrent(tabId, message)) return { ok: true, superseded: true };
-    if (browserSource?.candidates?.length) return await startBrowserDirectLive(tab, settings, browserSource, null, message);
+    if (browserSource?.candidates?.length) {
+      pushLog('info', `[media/route] 滚动前瞻候选=${browserSource.candidates.length} ` +
+        `首选=${browserSource.candidates[0].kind} 时长=${Number(browserSource.duration) || 0}s`);
+      return await startBrowserDirectLive(tab, settings, browserSource, null, message);
+    }
+    pushLog('warn', '[media/route] 未发现与当前播放器对应的可重放媒体地址，切到实时取音');
   } catch (error) {
+    pushLog('warn', `[media/route] 前瞻准备失败：${error?.message || String(error)}`);
     await sendLive(tabId, { type: 'BSCG_LIVE_PROGRESS', text: `浏览器整轨直取暂不可用，准备实时后备：${error?.message || String(error)}` });
   }
   if (!await isLiveStartCurrent(tabId, message)) return { ok: true, superseded: true };

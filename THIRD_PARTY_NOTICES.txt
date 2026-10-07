@@ -1,20 +1,23 @@
-# Third-party notices
+Third-party notices
+===================
 
-This proof-of-concept bundles runtime code from these packages:
+This repository contains or restores third-party runtime components used by the browser extension.
 
-- `@huggingface/transformers` 4.2.0 — Apache License 2.0
-- `onnxruntime-web` 1.26.0-dev.20260416-b7804b056c — MIT License
-- `mp4box` 2.4.1 — BSD 3-Clause License
+1. ONNX Runtime Web
+   Package: onnxruntime-web@1.22.0-dev.20250409-89f8206ba4
+   License: MIT
+   Runtime files are restored by scripts/restore-runtime.mjs and verified by SHA-256.
+   License copy: vendor/LICENSE-onnxruntime-mit.txt
 
-The speech model and preprocessing data are downloaded at runtime and are not included in the extension archive:
+2. Transformers.js
+   Package: @huggingface/transformers@3.8.1
+   License: Apache-2.0
+   vendor/transformers.min.js is restored by scripts/restore-runtime.mjs and verified by SHA-256.
+   License copy: vendor/LICENSE-transformers-apache-2.0.txt
 
-- `ruska1117/SenseVoiceSmall-onnx-fp16`, converted from `iic/SenseVoiceSmall`
-- `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17`
-- Original model project: `FunAudioLLM/SenseVoiceSmall`
-- `goryodog/tokihisu-qwen3-asr-0.6b-webgpu`, converted from `Qwen/Qwen3-ASR-0.6B`
-- Original Qwen3-ASR project: `QwenLM/Qwen3-ASR`
+3. MP4Box.js
+   Bundled file: vendor/mp4box.all.min.js
+   License: BSD-3-Clause
+   License copy: vendor/LICENSE-mp4box-bsd-3-clause.txt
 
-The archive includes the Transformers.js, ONNX Runtime, and MP4Box.js license texts in
-`vendor/`. SenseVoice remains subject to its upstream model license. The Qwen
-conversion and weights retain the upstream Apache-2.0 attribution; review all
-upstream repositories before production distribution.
+Model weights downloaded at runtime are separate third-party data and remain subject to their respective model licenses and hosting-service terms.

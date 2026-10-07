@@ -119,6 +119,10 @@ pre{min-height:40px;margin:0;padding:10px 12px;border:1px solid #d9e4f0;border-r
 .model-download-line strong{flex:0 0 auto;color:#2c4057;font-size:11.5px}
 .model-download-meta span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
 .model-download-error{margin-top:9px;padding-top:8px;border-top:1px solid #f0d9d9;color:#a33e3e;font-size:10.5px;line-height:1.45;word-break:break-word}
+/* 07 日志：落盘开关、绑定文件栏与滚动输出区 */
+#sec-logs .toggle-row{margin:6px 0 0}
+.log-file-bar{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:12px 0}
+.log-file-bar .hint{margin-top:0;flex:1 1 240px;min-width:0}
 #logsOutput{max-height:470px;overflow:auto;font-size:11px;line-height:1.55}
 
 /* 05 翻译：与既有卡片同一套变量，只做分区与「输入 + 动作按钮」两处新布局 */

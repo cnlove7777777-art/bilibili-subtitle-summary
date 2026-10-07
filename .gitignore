@@ -3,5 +3,10 @@ node_modules/
 *.zip
 .DS_Store
 
-# 23 MB runtime binary is reproducibly restored from the pinned npm package.
+# Reproducibly restored from pinned npm packages by scripts/restore-runtime.mjs.
+vendor/transformers.min.js
+vendor/ort.bundle.min.mjs
+vendor/ort-wasm-simd-threaded.asyncify.mjs
 vendor/ort-wasm-simd-threaded.asyncify.wasm
+vendor/ort-wasm-simd-threaded.jsep.mjs
+vendor/ort-wasm-simd-threaded.jsep.wasm
