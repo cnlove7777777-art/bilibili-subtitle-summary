@@ -147,7 +147,7 @@
       if (!video) return false;
       let rate = Math.max(1, Math.min(8, Number(message.playbackRate) || 4));
       const state = {
-        sessionId: String(message.sessionId || ''), video, rate, restoring: false, timer: 0,
+        sessionId: String(message.sessionId || ''), video, rate, restoring: false, timer: 0, rateMismatchSince: 0,
         original: {
           currentTime: Number(video.currentTime) || 0, duration: Number(video.duration) || 0,
           playbackRate: Number(video.playbackRate) || 1, defaultPlaybackRate: Number(video.defaultPlaybackRate) || 1,
@@ -205,6 +205,20 @@
             currentTime: video.currentTime, duration: video.duration, playbackRate: video.playbackRate,
             preservesPitch: video.preservesPitch, paused: video.paused });
           state.timer = setInterval(() => {
+            // Some sites repeatedly force the player's playbackRate back to
+            // 1–2×. A brief change during buffering is OK; sustained drift
+            // would corrupt every caption timestamp, so fail safely.
+            if (!video.paused && !video.seeking && Math.abs(video.playbackRate - state.rate) > 0.05) {
+              state.rateMismatchSince ||= Date.now();
+              if (Date.now() - state.rateMismatchSince >= 2000) {
+                clearInterval(state.timer);
+                void sendScan({ type: 'BSCG_SCAN_ERROR', sessionId: state.sessionId,
+                  error: `播放器无法维持 ${state.rate}× 扫描速度；请在设置中选 2× 或 4×` });
+                return;
+              }
+            } else {
+              state.rateMismatchSince = 0;
+            }
             if (rate > 1 && video.preservesPitch !== false) {
               void sendScan({ type: 'BSCG_SCAN_ERROR', sessionId: state.sessionId,
                 error: '播放器重新开启了保调，已停止倍速采集；请用 1× 重新识别' });
@@ -239,7 +253,7 @@
     return;
   }
 
-  const CS_VERSION = '0.16.44'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
+  const CS_VERSION = '0.16.51'; // 与 manifest 版本握手，防止更新后旧页面静默调用旧后台
   let staleBg = false;        // 后台 service worker 版本落后于界面脚本（扩展更新后未重载）
 
   const DESTINATIONS = {
@@ -266,11 +280,11 @@
     <style>
       :host{all:initial;--ink:#243342;--sub:#7b8aa0;--line:#d7e6fa;--paper:#ffffff;--primary:#2f7cf6;--primary-deep:#1f66d6;--tint:#eaf3ff}
       button{font:700 12px/1.2 system-ui,"Microsoft YaHei",sans-serif}
-      /* 左下角入口：折叠态只露出一小截色条，悬停色条（或键盘聚焦）才展开。
+      /* 左侧垂直居中入口：折叠态只露出一小截色条，悬停色条（或键盘聚焦）才展开。
          折叠态 #dock 必须 pointer-events:none —— 否则整块预留区域（原 58×114）都会
          吃 hover，鼠标扫过"按钮原本占的位置"就自动展开，等于没折叠。 */
       #dock{position:fixed;left:0;top:50%;bottom:auto;transform:translateY(-50%);pointer-events:none;display:flex;flex-direction:column;width:40px;padding-left:8px;box-sizing:border-box;filter:drop-shadow(0 5px 11px rgba(47,124,246,.25))}
-      #dock::before{content:"";position:absolute;left:2px;top:0;bottom:0;width:1.25px;border-radius:999px;background:linear-gradient(180deg,#70bbff,#2f7cf6 55%,#1f66d6);opacity:.85;transition:opacity .22s ease;pointer-events:none}
+      #dock::before{content:"";position:absolute;left:2px;top:0;bottom:0;width:2.5px;border-radius:999px;background:linear-gradient(180deg,#70bbff,#2f7cf6 55%,#1f66d6);opacity:.85;transition:opacity .22s ease;pointer-events:none}
       /* 折叠态唯一可命中的区域：色条左右各留 2~3px 的透明条，够好点又不会覆盖到
          隐藏按钮的那一列（按钮列从 padding-left:8px 起）。 */
       #dock::after{content:"";position:absolute;left:0;top:0;bottom:0;width:11px;background:transparent;pointer-events:auto}
@@ -509,6 +523,8 @@
   let voiceEnhanceEnabled = false;
   let voiceEnhancePreset = 'balanced';
   let transitioning = false;
+  let captionTransition = '';
+  let restartAfterStop = false;
   let captionCancelRequested = false;
   let summarizing = false;
   let summaryTaskId = '';
@@ -685,17 +701,6 @@
     logUiStatus(text);
   }
 
-  function genericPageIdentity(value) {
-    const url = new URL(value || location.href);
-    url.hash = '';
-    const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
-    for (const key of [...url.searchParams.keys()]) {
-      if (transient.test(key)) url.searchParams.delete(key);
-    }
-    url.searchParams.sort();
-    return url.href;
-  }
-
   function pageIdentity() {
     try {
       const url = new URL(location.href);
@@ -712,7 +717,7 @@
         const videoId = url.searchParams.get('v') || url.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
         return `youtube:${videoId}`;
       }
-      return `url:${genericPageIdentity(url.href)}`;
+      return `url:${url.href}`;
     } catch {
       return `url:${location.href}`;
     }
@@ -792,12 +797,14 @@
     return { left, top: 0, right: left + width, bottom: innerHeight, width, height: innerHeight };
   }
 
-  // Fixed dock: keep the compact launcher vertically centered on the left edge.
-  // Clear the old inline bottom offset as well, so an extension hot-update cannot
-  // leave a page stuck at the previous lower-left position.
+  // Fixed dock and reserved indicator slot: progress messages never measure,
+  // resize, mount or move the controls. CSS owns the vertical 50% anchor; do
+  // not mix an inline `bottom` constraint into it (that stretches the absolute
+  // box and also forces an offsetHeight layout read every polling tick).
   function positionDock() {
-    if (dock.style.top !== '50%') dock.style.top = '50%';
-    if (dock.style.bottom) dock.style.bottom = '';
+    if (dock.style.bottom) dock.style.removeProperty('bottom');
+    if (dock.style.top) dock.style.removeProperty('top');
+    if (dock.style.transform) dock.style.removeProperty('transform');
   }
 
   // “自动字幕”：页面出现视频后按设置自动开始本地字幕。每个视频只询问一次；
@@ -859,7 +866,8 @@
       boundVideos.add(candidate.video);
       candidate.video.addEventListener('seeked', () => {
         if (candidate.video !== activeVideo || liveMode === 'live') return;
-        replayUntil = Math.max(0, ...rows.map(row => Number(row.to) || 0));
+        replayUntil = 0;
+        for (const row of rows) replayUntil = Math.max(replayUntil, Number(row.to) || 0);
         captureHoldRow = null;
         captureHoldUntil = 0;
         stopLivePreviewTyping();
@@ -1009,7 +1017,20 @@
 
   function renderCurrentCue() {
     const currentTime = Math.max(0, Number(activeVideo?.currentTime) || 0);
-    const timeline = liveMode === 'live' ? null : rows.findLast((row) => row.from <= currentTime && row.to > currentTime) || null;
+    let timeline = null;
+    if (liveMode !== 'live' && rows.length) {
+      const index = rowUpperBound(currentTime) - 1;
+      // Cues are normally non-overlapping. Check a tiny local window so a
+      // translated replacement or boundary jitter cannot hide a still-active
+      // earlier cue, without falling back to an O(n) scan every frame.
+      for (let at = index, checked = 0; at >= 0 && checked < 4; at -= 1, checked += 1) {
+        const row = rows[at];
+        if (Number(row.from) <= currentTime && Number(row.to) > currentTime) {
+          timeline = row;
+          break;
+        }
+      }
+    }
     const realtime = ['capture', 'live'].includes(liveMode);
     const displayRows = captionDisplayRows(timeline, realtime ? captureHoldRow : null,
       captureHoldUntil, realtime ? livePreviewRow : null, performance.now(), liveMode === 'live' ? Infinity : currentTime, replayUntil);
@@ -1071,15 +1092,18 @@
   }
 
   function cueAtTime(time) {
-    // 精确命中（时间落在某行区间内）优先；未命中时取时间上最近的一行，
-    // 让悬停预览稳定出现——预生成字幕的行区间有间隙（静音段），
-    // 严格区间匹配会让预览时有时无，用户观感是"坏了"。
-    for (const row of rows) {
-      if (time >= row.from - 0.05 && time <= row.to + 0.05) return row;
+    // 精确命中优先；静音间隙则取二分点两侧最近的一行。以前鼠标每 33ms
+    // 会完整扫描 rows 两遍，长片悬停进度条时主线程开销会线性增长。
+    const at = rowLowerBound(time);
+    const candidates = [];
+    for (let index = Math.max(0, at - 3); index <= Math.min(rows.length - 1, at + 2); index += 1) {
+      const row = rows[index];
+      if (time >= Number(row.from) - 0.05 && time <= Number(row.to) + 0.05) return row;
+      candidates.push(row);
     }
     let nearest = null;
     let nearestDistance = Infinity;
-    for (const row of rows) {
+    for (const row of candidates) {
       const distance = time < row.from ? row.from - time : time > row.to ? time - row.to : 0;
       if (distance < nearestDistance) {
         nearestDistance = distance;
@@ -1191,7 +1215,56 @@
     menuExport.disabled = rows.length === 0;
   }
 
+  // `rows` is kept sorted by `from`. Subtitle playback runs on every animation
+  // frame, so linear scans become surprisingly expensive on long videos (10k+
+  // cues). Keep all hot-path lookups logarithmic and only pay array shifting when
+  // an out-of-order cue really has to be inserted.
+  function rowLowerBound(time) {
+    let low = 0;
+    let high = rows.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (Number(rows[middle].from) < time) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
+  function rowUpperBound(time) {
+    let low = 0;
+    let high = rows.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (Number(rows[middle].from) <= time) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+
+  function rowIndexNear(from, tolerance = 0.05) {
+    const at = rowLowerBound(from);
+    let best = -1;
+    let bestDistance = tolerance;
+    for (const index of [at - 1, at, at + 1]) {
+      if (index < 0 || index >= rows.length) continue;
+      const distance = Math.abs(Number(rows[index].from) - from);
+      if (distance < bestDistance || (distance === bestDistance && best < 0)) {
+        best = index;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+
+  function upsertRowSorted(normalized) {
+    const near = rowIndexNear(normalized.from);
+    if (near >= 0) rows[near] = normalized;
+    else rows.splice(rowLowerBound(normalized.from), 0, normalized);
+    if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS);
+  }
+
   function mergeSegments(segments) {
+    const incoming = [];
     for (const row of segments || []) {
       if (!row?.content) continue;
       const normalized = {
@@ -1201,11 +1274,31 @@
       };
       if (row.sourceContent) normalized.sourceContent = String(row.sourceContent);
       if (row.originalContent) normalized.originalContent = String(row.originalContent);
-      const existingIndex = rows.findIndex((item) => Math.abs(Number(item.from) - normalized.from) < 0.05);
-      if (existingIndex >= 0) rows[existingIndex] = normalized; else rows.push(normalized);
+      incoming.push(normalized);
     }
-    rows.sort((a, b) => a.from - b.from);
-    if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS);
+    if (!incoming.length) {
+      refreshExportState();
+      return;
+    }
+    // Hydration/cache replay commonly brings hundreds or thousands of cues at
+    // once. One sort + one compaction is O((n+m) log(n+m)); repeated findIndex
+    // was O(n*m) and made reopening a long transcript noticeably janky.
+    if (incoming.length > 8) {
+      const tagged = rows.map((row) => ({ row, incoming: false }))
+        .concat(incoming.map((row) => ({ row, incoming: true })));
+      tagged.sort((a, b) => Number(a.row.from) - Number(b.row.from) || Number(a.incoming) - Number(b.incoming));
+      const compact = [];
+      for (const item of tagged) {
+        const last = compact.at(-1);
+        if (last && Math.abs(Number(last.row.from) - Number(item.row.from)) < 0.05) {
+          if (item.incoming || !last.incoming) compact[compact.length - 1] = item;
+        } else compact.push(item);
+      }
+      rows.length = 0;
+      rows.push(...compact.slice(-MAX_ROWS).map((item) => item.row));
+    } else {
+      for (const row of incoming) upsertRowSorted(row);
+    }
     refreshExportState();
   }
 
@@ -1265,7 +1358,7 @@
       liveMode = alreadyFinished && response.mode !== 'live' ? 'file' : response.mode || 'capture';
       resetForSession(response.sessionId, liveMode !== 'live' && (rows.length > 0 || response.segments?.length > 0));
       mergeSegments(response.segments);
-      setRunning(!alreadyFinished);
+      setRunning(!alreadyFinished && response.running !== false);
       if (response.reused) {
         setStatus(`已复用之前的字幕（${response.rows} 段）`);
         showFeedback('已复用缓存；重新识别请先清除缓存', 3000);
@@ -1288,26 +1381,48 @@
     setStatus('正在处理最后一段…');
     const response = await sendRuntime({ type: 'BSCG_LIVE_STOP', fromControls: true });
     if (!response?.ok) throw new Error(response?.error || '停止失败');
+    return response;
+  }
+
+  function rememberCurrentSiteChoice(enabled, pageUrl = location.href) {
+    // Fire-and-forget: storage should never make the caption button feel slower.
+    // The background serializes concurrent tab updates to avoid lost-site races.
+    void sendRuntime({ type: 'BSCG_CAPTION_SITE_CHOICE', enabled: Boolean(enabled), pageUrl }).catch(() => {});
   }
 
   async function toggleCaptions() {
+    const choicePageUrl = location.href;
     autoResumeAfterSwitch = false;
     captionActionVersion += 1;
     autoStartAttempted = currentPageIdentity;
     if (transitioning) {
-      captionCancelRequested = true;
-      captionsDismissed = true;
-      setCaptionVisibility(false);
-      showFeedback('已请求取消字幕', 2200);
+      if (captionTransition === 'stop') {
+        // A second click while the previous session is flushing means “I changed
+        // my mind, reopen it”. Further clicks toggle that queued intent so the
+        // latest click wins instead of every extra click forcing a restart.
+        restartAfterStop = !restartAfterStop;
+        captionsDismissed = !restartAfterStop;
+        rememberCurrentSiteChoice(restartAfterStop, choicePageUrl);
+        showFeedback(restartAfterStop ? '关闭收尾后会重新开启字幕' : '已取消重新开启，保持关闭', 2400);
+      } else {
+        captionCancelRequested = true;
+        restartAfterStop = false;
+        captionsDismissed = true;
+        rememberCurrentSiteChoice(false, choicePageUrl);
+        setCaptionVisibility(false);
+        showFeedback('已请求取消字幕', 2200);
+      }
       return;
     }
     if (staleBg) { showFeedback('扩展已更新：请到 chrome://extensions 点"重新加载"后刷新本页', 4200); return; }
     transitioning = true;
     captionCancelRequested = false;
+    restartAfterStop = false;
     activityError = false;
     capBtn.classList.add('busy');
     try {
       if (!running && !captionsVisible) {
+        captionTransition = 'start';
         if (rows.length && liveMode !== 'live' && (liveMode === 'file' ||
             (finishedCaptionSessionId && finishedCaptionSessionId === currentSessionId))) {
           liveMode = 'file';
@@ -1320,15 +1435,28 @@
         } else {
           await startRecognition();
         }
+        if (running || captionsVisible) rememberCurrentSiteChoice(true, choicePageUrl);
       } else {
+        captionTransition = 'stop';
         if (liveMode !== 'live' && finishedCaptionSessionId && finishedCaptionSessionId === currentSessionId) liveMode = 'file';
         captionsDismissed = true;
+        rememberCurrentSiteChoice(false, choicePageUrl);
         setCaptionVisibility(false);
         setRunning(false);
         showFeedback('正在关闭字幕…');
-        await stopRecognition();
+        const stopResponse = await stopRecognition();
         setRunning(false);
-        showFeedback('字幕已关闭', 2400);
+        if (restartAfterStop) {
+          restartAfterStop = false;
+          captionCancelRequested = false;
+          captionsDismissed = false;
+          captionTransition = 'start';
+          rememberCurrentSiteChoice(true, choicePageUrl);
+          showFeedback(stopResponse?.stopping ? '上一轮正在收尾，随后重新开启…' : '正在重新开启字幕…', 2600);
+          await startRecognition();
+        } else {
+          showFeedback(stopResponse?.stopping ? '字幕已隐藏，后台正在收尾最后一段' : '字幕已关闭', 2600);
+        }
       }
     } catch (error) {
       setRunning(false);
@@ -1336,6 +1464,8 @@
       showFeedback(`字幕操作失败：${error?.message || String(error)}`, 8000, true);
     } finally {
       transitioning = false;
+      captionTransition = '';
+      restartAfterStop = false;
       captionCancelRequested = false;
       capBtn.classList.remove('busy');
       updateActivity();
@@ -1861,10 +1991,7 @@
       renderCurrentCue();
     } else if (message?.type === 'BSCG_LIVE_SEGMENT' && message.segment?.content) {
       const segment = { ...message.segment, sequence: Number.isFinite(message.sequence) ? message.sequence : rows.length };
-      const existingIndex = rows.findIndex((row) => Math.abs(Number(row.from) - Number(segment.from)) < 0.05);
-      if (existingIndex >= 0) rows[existingIndex] = segment; else rows.push(segment);
-      rows.sort((a, b) => Number(a.from) - Number(b.from));
-      if (rows.length > MAX_ROWS) rows.splice(0, rows.length - MAX_ROWS);
+      upsertRowSorted(segment);
       if (!message.finalDisplayManaged && ['capture', 'live'].includes(liveMode)) {
         captureHoldRow = segment;
         const readableMs = Math.max(4000, Math.min(10000, (Number(segment.to) - Number(segment.from)) * 750));
@@ -1982,7 +2109,9 @@
   }, 800);
   function renderCaptionFrame() {
     if (!extensionAlive()) return;
-    renderCurrentCue();
+    // Hidden captions do not need a timeline lookup every animation frame.
+    // Position reporting still runs while recognition is active.
+    if (captionsVisible) renderCurrentCue();
     reportVideoPosition(activeVideo);
     requestAnimationFrame(renderCaptionFrame);
   }
@@ -2033,6 +2162,66 @@
     let captionsDismissed = false;
     let displayRevision = 0;
     let rows = [];
+    // Prefix maximum end times form an interval index for iframe caption lookup.
+    // Even long/overlapping captions remain searchable without scanning a whole
+    // multi-hour transcript on each animation frame.
+    let framePrefixEnds = [];
+    function rebuildFrameIndex() {
+      rows.sort((a, b) => Number(a.from) - Number(b.from));
+      framePrefixEnds = new Array(rows.length);
+      let maximum = 0;
+      for (let i = 0; i < rows.length; i += 1) {
+        maximum = Math.max(maximum, Number(rows[i].to) || 0);
+        framePrefixEnds[i] = maximum;
+      }
+    }
+    function frameUpperBound(time) {
+      let low = 0, high = rows.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (Number(rows[mid].from) <= time) low = mid + 1;
+        else high = mid;
+      }
+      return low;
+    }
+    function frameCueAtTime(time) {
+      for (let at = frameUpperBound(time) - 1; at >= 0 && framePrefixEnds[at] > time; at -= 1) {
+        if (Number(rows[at].to) > time) return rows[at];
+      }
+      return null;
+    }
+    function frameFirstCueNear(time, tolerance = 0.05) {
+      // First interval whose end reaches time. The prefix-max index preserves
+      // the old "first matching subtitle" priority even for overlaps.
+      let low = 0, high = frameUpperBound(time + tolerance);
+      const limit = high;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (framePrefixEnds[mid] < time - tolerance) low = mid + 1;
+        else high = mid;
+      }
+      const row = low < limit ? rows[low] : null;
+      return row && Number(row.to) >= time - tolerance ? row : null;
+    }
+    function upsertFrameRow(segment) {
+      const at = frameUpperBound(segment.from);
+      let replace = -1;
+      for (let i = Math.max(0, at - 2); i < Math.min(rows.length, at + 2); i += 1) {
+        if (Math.abs(Number(rows[i].from) - segment.from) < 0.05) { replace = i; break; }
+      }
+      const changed = replace >= 0 ? replace : at;
+      if (replace >= 0) {
+        // Preserve the canonical sorting key when timestamps drift by <50ms.
+        segment.from = rows[replace].from;
+        rows[replace] = segment;
+      } else rows.splice(at, 0, segment);
+      let maximum = changed ? framePrefixEnds[changed - 1] : 0;
+      for (let i = changed; i < rows.length; i += 1) {
+        maximum = Math.max(maximum, Number(rows[i].to) || 0);
+        framePrefixEnds[i] = maximum;
+      }
+      framePrefixEnds.length = rows.length;
+    }
     let captionsEl = null;
     let frameCaptionsVisible = false;
     let cueMount = null;
@@ -2130,7 +2319,7 @@
       captionsEl.style.top = `${Math.max(rect.top + 30, rect.bottom - Math.max(96, rect.height * 0.18))}px`;
       captionsEl.style.fontSize = `${Math.round(Math.max(16, Math.min(30, rect.width * 0.026)))}px`;
       const currentTime = Math.max(0, Number(video.currentTime) || 0);
-      const timeline = frameMode === 'live' ? null : rows.findLast((row) => row.from <= currentTime && row.to > currentTime) || null;
+      const timeline = frameMode === 'live' ? null : frameCueAtTime(currentTime);
       const realtime = ['capture', 'live'].includes(frameMode);
       const displayRows = captionDisplayRows(timeline, realtime ? holdRow : null, holdUntil,
         realtime ? previewRow : null, performance.now(), frameMode === 'live' ? Infinity : currentTime, replayUntil);
@@ -2158,7 +2347,7 @@
         boundMedia.add(found);
         found.addEventListener('seeked', () => {
           if (video !== found || frameMode === 'live') return;
-          replayUntil = Math.max(0, ...rows.map(row => Number(row.to) || 0));
+          replayUntil = framePrefixEnds.at(-1) || 0;
           holdRow = null;
           holdUntil = 0;
           previewRow = null;
@@ -2192,6 +2381,7 @@
             to: Math.max(Number(row.from) || 0, Number(row.to) || 0),
             content: String(row.content || '')
           })).filter((row) => row.content);
+          rebuildFrameIndex();
           previewRow = response.previewSegment?.content ? { ...response.previewSegment } : null;
           holdRow = response.finalSegment?.content ? { ...response.finalSegment } : null;
           previewRevision = Math.max(0, Number(response.previewSegment?.revision) || 0);
@@ -2210,6 +2400,7 @@
           running = false;
           currentSessionId = message.sessionId || currentSessionId;
           rows = (message.segments || []).filter((row) => row?.content);
+          rebuildFrameIndex();
         }
         if (message.visible) ensureOverlay();
         setFrameCaptionVisibility(!topOwnsOverlay && message.visible);
@@ -2229,6 +2420,7 @@
         frameMode = running ? message.mode || 'capture' : 'file';
         topOwnsOverlay = Boolean(message.overlayOnTop);
         rows = [];
+        framePrefixEnds = [];
         replayUntil = 0;
         holdRow = null;
         previewRow = null;
@@ -2243,7 +2435,7 @@
           if (row.sourceContent) seeded.sourceContent = String(row.sourceContent);
           rows.push(seeded);
         }
-        rows.sort((a, b) => a.from - b.from);
+        rebuildFrameIndex();
         ensureOverlay();
         setFrameCaptionVisibility(!topOwnsOverlay && !captionsDismissed);
         renderCue();
@@ -2262,9 +2454,7 @@
           content: String(message.segment.content)
         };
         if (message.segment.sourceContent) segment.sourceContent = String(message.segment.sourceContent);
-        const index = rows.findIndex((row) => Math.abs(row.from - segment.from) < 0.05);
-        if (index >= 0) rows[index] = segment; else rows.push(segment);
-        rows.sort((a, b) => a.from - b.from);
+        upsertFrameRow(segment);
         if (!message.finalDisplayManaged) {
           holdRow = segment;
           holdUntil = performance.now() + Math.max(4000, Math.min(10000, (segment.to - segment.from) * 750));
@@ -2304,6 +2494,7 @@
         const from = Math.max(0, Number(message.from) || 0);
         const to = Math.max(from, Number(message.to) || from);
         rows = rows.filter((row) => !(row.to > from && row.from < to));
+        rebuildFrameIndex();
         holdRow = null;
         previewRow = null;
         previewRevision = 0;
@@ -2357,10 +2548,7 @@
         anchorTop = rect.top;
       }
       const time = ratio * duration;
-      let cue = null;
-      for (const row of rows) {
-        if (time >= row.from - 0.05 && time <= row.to + 0.05) { cue = row; break; }
-      }
+      const cue = frameFirstCueNear(time);
       if (!cue || !cue.content) { hideSeekPreview(); return; }
       ensureOverlay();
       seekPreviewEl.style.left = `${Math.max(8, Math.min(innerWidth - seekPreviewEl.offsetWidth - 8, event.clientX - seekPreviewEl.offsetWidth / 2))}px`;
@@ -2959,8 +3147,8 @@
             state.recentMaxRms = 0;
           } else if (!nonzero && !state.videoEl.muted && state.videoEl.volume > 0) {
             taintedMediaElements.add(state.videoEl);
-            noteCapture(state, '页面内取到的是静音数据（视频可能被加密保护）。请重新点「字幕」重试；若仍失败请按 Alt+Shift+S。');
-            chrome.runtime.sendMessage({ type: 'BSCG_CAPTURE_ERROR', sessionId: state.sessionId, error: '页面内取音被浏览器静音（跨源或加密内容）' }).catch(() => {});
+            noteCapture(state, state.scanMode ? '高速扫描未收到音频（可能被播放器静音）。请到设置中将连续扫描速度改为 2× 或 4× 后重试。' : '页面内取到的是静音数据（视频可能被加密保护）。请重新点「字幕」重试；若仍失败请按 Alt+Shift+S。');
+            chrome.runtime.sendMessage({ type: 'BSCG_CAPTURE_ERROR', sessionId: state.sessionId, error: state.scanMode ? '高倍速下播放器输出静音；请把连续扫描速度降到 2× 或 4× 后重试' : '页面内取音被浏览器静音（跨源或加密内容）' }).catch(() => {});
             void stopInpageCapture('tainted-silence', state.sessionId).catch(() => {});
             return;
           } else {

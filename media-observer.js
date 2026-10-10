@@ -10,7 +10,7 @@
 
   const records = [];
   const playurlRecords = [];
-  const seen = new Set();
+  const seen = new Map();
   const isFragment = (url) => /\.(?:m4s|cmfa|cmfv|ts)(?:$|[?#])/i.test(url);
   const mediaFile = (url) => /\.(?:mp4|m4a|m4v|mov|webm|mp3|aac|ogg|opus|flac|wav)(?:$|[?#])/i.test(url);
   const isBilibiliPlayurl = (value) => {
@@ -38,12 +38,12 @@
       if (kind === 'media' && isFragment(url)) kind = 'fragment';
       const key = `${kind}\n${url}`;
       if (seen.has(key)) {
-        const existing = records.find(record => record.url === url && record.kind === kind);
-        if (existing) Object.assign(existing, { pageUrl: location.href }, metadata);
+        Object.assign(seen.get(key), { pageUrl: location.href }, metadata);
         return;
       }
-      seen.add(key);
-      records.push({ url, kind, at: performance.now(), pageUrl: location.href, ...metadata });
+      const record = { url, kind, at: performance.now(), pageUrl: location.href, ...metadata };
+      seen.set(key, record);
+      records.push(record);
       while (records.length > 240) {
         const removed = records.shift();
         seen.delete(`${removed.kind}\n${removed.url}`);
@@ -137,12 +137,12 @@
         if (requestedPage !== location.href) return response;
         const type = response.headers?.get('content-type') || '';
         if (/mpegurl/i.test(type)) {
-          remember(response.url || requestUrl, 'hls');
+          remember(response.url || requestUrl, 'hls', { mimeType: type });
           void inspectFetchedHls(response, response.url || requestUrl).catch(() => {});
         }
-        else if (/dash\+xml/i.test(type)) remember(response.url || requestUrl, 'dash');
-        else if (/^audio\//i.test(type)) remember(response.url || requestUrl, isFragment(response.url || requestUrl) ? 'audio-fragment' : 'media');
-        else if (/^video\//i.test(type)) remember(response.url || requestUrl, 'media');
+        else if (/dash\+xml/i.test(type)) remember(response.url || requestUrl, 'dash', { mimeType: type });
+        else if (/^audio\//i.test(type)) remember(response.url || requestUrl, isFragment(response.url || requestUrl) ? 'audio-fragment' : 'media', { mimeType: type });
+        else if (/^video\//i.test(type)) remember(response.url || requestUrl, 'media', { mimeType: type });
         if (isBilibiliPlayurl(response.url || requestUrl)) {
           void response.clone().json().then((payload) => rememberPlayurl(response.url || requestUrl, payload, requestedPage)).catch(() => {});
         }
@@ -164,17 +164,17 @@
           const responseUrl = this.responseURL || url;
           const type = this.getResponseHeader('content-type') || '';
           if (/mpegurl/i.test(type)) {
-            remember(this.responseURL || url, 'hls');
+            remember(this.responseURL || url, 'hls', { mimeType: type });
             const text = this.responseType === 'arraybuffer' && this.response?.byteLength <= 262144
               ? new TextDecoder().decode(this.response)
               : !this.responseType || this.responseType === 'text' ? this.responseText : '';
             inspectHls(responseUrl, text);
           } else if (/dash\+xml/i.test(type)) {
-            remember(this.responseURL || url, 'dash');
+            remember(this.responseURL || url, 'dash', { mimeType: type });
           } else if (/^audio\//i.test(type)) {
-            remember(responseUrl, isFragment(responseUrl) ? 'audio-fragment' : 'media');
+            remember(responseUrl, isFragment(responseUrl) ? 'audio-fragment' : 'media', { mimeType: type });
           } else if (/^video\//i.test(type)) {
-            remember(responseUrl, 'media');
+            remember(responseUrl, 'media', { mimeType: type });
           }
           if (isBilibiliPlayurl(responseUrl)) {
             const payload = typeof this.response === 'object' && this.response

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "minimum_chrome_version": "121",
-  "name": "任意视频总结与直播实时字幕 · 本地识别 | Video Summary & Local Live Captions",
-  "version": "0.16.44",
-  "description": "纯浏览器本地字幕与视频总结辅助；可将字幕准备到 ChatGPT、Gemini 或 DeepSeek，发送前由用户确认。",
+  "name": "网页视频实时字幕与总结 | Local Video Captions",
+  "version": "0.16.51",
+  "description": "为网页视频生成和显示本地识别字幕；支持可选翻译及用户主动发起的字幕总结，远程服务仅在选择后使用。",
   "permissions": [
     "storage",
     "alarms",
@@ -39,7 +39,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
-    "default_title": "任意视频总结与直播实时字幕 · 本地识别 | Video Summary & Local Live Captions",
+    "default_title": "网页视频实时字幕与总结 | Local Video Captions",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

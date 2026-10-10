@@ -42,6 +42,8 @@ const HLS_WINDOW_SECONDS = 30;
 const HLS_MIN_STARTUP_SEGMENTS = 1;
 const DASH_STARTUP_SECONDS = 8.5;
 const DASH_RANGE_CHUNK_BYTES = 512 * 1024;
+const DASH_INDEX_MAX_HEADER_BYTES = 8 * 1024 * 1024;
+const DASH_INDEX_MAX_WINDOW_BYTES = 16 * 1024 * 1024;
 const DIRECT_PROBE_BYTES = 64 * 1024;
 const DIRECT_PROBE_TIMEOUT_MS = 4 * 1000;
 const LOCAL_UPLOAD_TTL_MS = 30 * 60 * 1000;
@@ -1174,6 +1176,27 @@ function receiveTabAudio(state, samples) {
     void failSession(state, engineError('扫描倍速或保调状态发生变化，已停止；请用 1× 重新识别', 'CAPTURE_RATE_UNSUPPORTED'));
     return;
   }
+  // Detect completely muted accelerated playback before spending minutes
+  // 'transcribing' silence. Check the raw captured PCM, not the stretched data.
+  // A long silent video intro is possible; only abort after 15 wall seconds of
+  // digital silence at experimental 6–8× speeds.
+  if (state.scanPlaybackRate >= 6 && samples.length) {
+    let peak = 0;
+    for (let i = 0; i < samples.length; i += 1) {
+      const sample = Math.abs(samples[i]);
+      if (sample > peak) peak = sample;
+      if (peak >= 0.001) break;
+    }
+    if (peak >= 0.001) {
+      state.scanHeardAudio = true;
+    } else if (!state.scanHeardAudio) {
+      state.scanSilentWallSeconds = (state.scanSilentWallSeconds || 0) + samples.length / state.captureSourceRate;
+      if (state.scanSilentWallSeconds >= 15) {
+        void failSession(state, engineError('高倍速扫描持续收到静音；请将连续扫描速度降至 2× 或 4× 后重试', 'SCAN_HIGH_RATE_SILENCE'));
+        return;
+      }
+    }
+  }
   state.captureResampler ||= self.BscgCaptureAudio.createResampler(state.captureSourceRate, state.scanPlaybackRate);
   const restored = state.captureResampler.process(samples);
   state.metrics.captureWallSeconds = (state.metrics.captureWallSeconds || 0) + samples.length / state.captureSourceRate;
@@ -1193,6 +1216,8 @@ function prepareScanCapture(message) {
   state.scanPlaybackRate = rate;
   state.scanReady = true;
   state.captureResampler = null;
+  state.scanHeardAudio = false;
+  state.scanSilentWallSeconds = 0;
   resetCaptureTimeline(state);
   try { state.worklet?.port.postMessage({ type: 'reset' }); } catch {}
   state.clock = initialCaptureClock({ ...message, paused: false });
@@ -1337,7 +1362,7 @@ function cleanText(text) {
 
 // ── 静音幻觉（幽灵短语）拦截 ────────────────────────────────────────────────
 // SenseVoice 在纯静音/噪声/极短人声上会吐出训练语料里的固定短语。0.16.36 实机日志
-// （omgjav.com 日语访谈，voicedMs 20–1320ms）里"整句"出现的只有这几个：
+// （历史短语音频测试，voicedMs 20–1320ms）里"整句"出现的只有这几个：
 //   The. / Yeah. / Oh. / Magic again. / Mジ game. / 系y。
 // 它们全部落在 voicedMs < 1.5s（或音频 < 2.5s）的 strong-silence / pause 段上，
 // 与"用户真的说了个英文单词"无关。判定必须同时满足"文本命中白名单"+"段确实很短"，
@@ -1388,6 +1413,34 @@ function splitCaptionText(text, maximumCharacters = 18) {
   return parts;
 }
 
+function cueLowerBound(cues, from) {
+  let low = 0;
+  let high = cues.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (Number(cues[middle].from) < from) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function findDuplicateCue(cues, text, from) {
+  const at = cueLowerBound(cues, from);
+  for (let index = Math.max(0, at - 3); index <= Math.min(cues.length - 1, at + 2); index += 1) {
+    const cue = cues[index];
+    if (cue.text === text && Math.abs(Number(cue.from) - from) < 0.05) return cue;
+  }
+  return null;
+}
+
+function insertCueSorted(cues, cue) {
+  const at = cueLowerBound(cues, cue.from);
+  // Most recognition results are monotonic; append is O(1). The splice path is
+  // only for seek/recovery results arriving out of order.
+  if (at === cues.length) cues.push(cue);
+  else cues.splice(at, 0, cue);
+}
+
 function addResultCues(state, pending, message) {
   const resultCues = [];
   const audioSeconds = Math.max(0.1, Number(message.audioSeconds) || pending.audioSeconds);
@@ -1413,12 +1466,11 @@ function addResultCues(state, pending, message) {
     if (chunkTo <= chunkFrom) continue;
     // Only ASR/audio timestamps are authoritative. Character-count splitting
     // invents alignment and can send half of a Japanese predicate to translation.
-    const duplicate = state.cues.find(cue => cue.text === text && Math.abs(cue.from - chunkFrom) < 0.05);
+    const duplicate = findDuplicateCue(state.cues, text, chunkFrom);
     const cue = duplicate || { from: chunkFrom, to: chunkTo, text };
     resultCues.push(cue);
-    if (!duplicate) state.cues.push(cue);
+    if (!duplicate) insertCueSorted(state.cues, cue);
   }
-  state.cues.sort((a, b) => a.from - b.from || a.to - b.to);
   return resultCues;
 }
 
@@ -1991,9 +2043,10 @@ async function releaseDirectRequestHeaders(state) {
   }).catch(() => {});
 }
 
-async function fetchExactRange(state, url, start, end, totalHint = 0) {
+async function fetchExactRange(state, url, start, end, totalHint = 0, signal = undefined) {
   const request = await openSessionFetch(state, url, {
     cache: 'no-store', credentials: 'include', redirect: 'follow',
+    signal,
     headers: { Range: `bytes=${start}-${end}` }
   });
   try {
@@ -2008,7 +2061,7 @@ async function fetchExactRange(state, url, start, end, totalHint = 0) {
     if (responseEnd > end || (totalHint && total !== totalHint) || total > MP4_MAX_NETWORK_BYTES) {
       throw new Error(`CDN Range 元数据不一致：${contentRange}`);
     }
-    const buffer = await readSessionResponse(request, end - start + 1, (received) => {
+    const buffer = await readSessionResponse(request, end - start + 1, signal ? null : (received) => {
       updateAudioDownloadProgress(state, start + received, total);
     });
     if (buffer.byteLength !== responseEnd - start + 1) {
@@ -2018,6 +2071,228 @@ async function fetchExactRange(state, url, start, end, totalHint = 0) {
   } finally {
     request.close();
   }
+}
+
+// MP4Box builds the ordinary (non-fragmented) AAC sample table from `moov`.
+// The table is a direct time -> byte index: no need to download/decode the
+// prefix when the viewer first seeks deep into a VOD. Fragmented media,
+// nontrivial edits and unbounded interleaving use the older safe reader.
+async function downloadIndexedMp4Audio(state, probe) {
+  if (!self.MP4Box?.createFile || typeof AudioDecoder !== 'function' || typeof EncodedAudioChunk !== 'function') {
+    throw new Error('当前环境没有 WebCodecs/MP4Box 索引读取能力');
+  }
+  // `moov` after `mdat` requires downloading the media body to discover the
+  // sample table. Detect that layout from the first Range response and avoid
+  // a pointless near-full download before falling back to the old reader.
+  const prefix = new Uint8Array(probe.buffer);
+  const prefixView = new DataView(probe.buffer);
+  for (let at = 0; at + 8 <= prefix.length;) {
+    let boxSize = prefixView.getUint32(at, false);
+    const type = asciiAt(prefix, at + 4, 4);
+    const headerSize = boxSize === 1 ? 16 : 8;
+    if (boxSize === 1) {
+      if (at + 16 > prefix.length) break;
+      boxSize = Number(prefixView.getBigUint64(at + 8, false));
+    }
+    if (type === 'moov') break;
+    if (type === 'mdat' || type === 'moof' || boxSize === 0) {
+      throw new Error('MP4 媒体数据位于索引之前，使用顺序解码兜底');
+    }
+    if (!Number.isSafeInteger(boxSize) || boxSize < headerSize) throw new Error('MP4 文件头损坏');
+    at += boxSize;
+  }
+  const parser = self.MP4Box.createFile();
+  const total = Number(probe.total);
+  let index = null;
+  let rejection = null;
+  parser.onError = error => { rejection = new Error(`MP4 采样表解析失败：${errorText(error)}`); };
+  parser.onReady = info => {
+    try {
+      if ((info.videoTracks || []).length || (info.audioTracks || []).length !== 1 || info.isFragmented) {
+        throw new Error('索引读取仅支持单独的非分片 AAC 音轨');
+      }
+      const track = info.audioTracks[0];
+      if (!/^mp4a\.40\.[25]$/i.test(track.codec || '')) throw new Error('索引读取仅支持 AAC LC/HE AAC');
+      const trak = parser.getTrackById(track.id);
+      const samples = trak?.samples;
+      const edits = trak?.edts?.elst?.entries || [];
+      if (!samples?.length || samples.length > 600000 || !trak?.mdia?.minf?.stbl?.stco && !trak?.mdia?.minf?.stbl?.co64) {
+        throw new Error('音轨缺少完整且有界的 MP4 sample 索引');
+      }
+      if (edits.length > 1 || edits.some(edit => edit.media_time < 0 || edit.media_rate_integer !== 1 ||
+          edit.media_rate_fraction !== 0 || edit.media_time > Number(track.timescale) * 2)) {
+        throw new Error('音轨存在复杂 edit list，需顺序读取保证时间戳');
+      }
+      const rate = Number(track.timescale);
+      const editOffset = edits.length ? Number(edits[0].media_time) : 0;
+      if (!Number.isSafeInteger(rate) || rate < 8000 || !Number.isSafeInteger(editOffset)) throw new Error('MP4 时间基无效');
+      let lastByte = -1;
+      let lastPts = -Infinity;
+      for (const sample of samples) {
+        if (!Number.isSafeInteger(sample.offset) || !Number.isSafeInteger(sample.size) || sample.size <= 0 ||
+            sample.offset < lastByte || sample.offset + sample.size > total ||
+            !Number.isSafeInteger(sample.cts) || !Number.isFinite(sample.duration) || sample.duration <= 0 ||
+            sample.cts < lastPts) throw new Error('MP4 sample 偏移/时间戳无序或越界');
+        lastByte = sample.offset + sample.size;
+        lastPts = sample.cts;
+      }
+      const duration = Number(track.duration) / rate;
+      const effectiveEnd = (samples.at(-1).cts + samples.at(-1).duration - editOffset) / rate;
+      if (Math.abs(samples[0].cts / rate) > 0.25 || !(duration > 0) ||
+          Math.abs(effectiveEnd - duration) > Math.max(0.3, duration * 0.01)) {
+        throw new Error('音轨索引与 MP4 播放时间线不一致');
+      }
+      validateDirectMediaDuration(duration, state.directSource?.duration, 'MP4 索引');
+      index = { samples, rate, editOffset, duration, config: mp4AudioDecoderConfig(parser, track) };
+    } catch (error) { rejection = error; }
+  };
+  const append = (buffer, offset) => {
+    buffer.fileStart = offset;
+    parser.appendBuffer(buffer);
+    if (rejection) throw rejection;
+  };
+  append(probe.buffer, 0);
+  let headerBytes = probe.buffer.byteLength;
+  while (!index && headerBytes < Math.min(total, DASH_INDEX_MAX_HEADER_BYTES)) {
+    if (state.stopping || activeSession !== state) throw engineError('任务已停止', 'TASK_CANCELLED');
+    const next = Math.min(total, DASH_INDEX_MAX_HEADER_BYTES, headerBytes + DASH_RANGE_CHUNK_BYTES);
+    const part = await fetchExactRange(state, probe.candidate.url, headerBytes, next - 1, total);
+    append(part.buffer, headerBytes);
+    headerBytes = part.end + 1;
+  }
+  if (!index) throw new Error('文件头部 8 MiB 内没有可用的完整音轨索引');
+  let controller = new AbortController();
+  let disposed = false;
+  let downloaded = headerBytes;
+  const windowCache = new Map();
+  let cacheBytes = 0;
+  const readWindow = async (time, seconds = HLS_WINDOW_SECONDS) => {
+    const signal = controller.signal;
+    if (signal.aborted || disposed) throw engineError('索引窗口已取消', 'TASK_CANCELLED');
+    const start = Math.max(0, Math.min(index.duration, (Number(time) || 0) - 0.5));
+    const end = Math.min(index.duration, Math.max(start, Number(time) + seconds || 0));
+    if (end <= start) return null;
+    for (const [key, cached] of windowCache) {
+      if (start >= cached.start && end <= cached.end) {
+        windowCache.delete(key);
+        windowCache.set(key, cached);
+        state.metrics.dashIndexCacheHits = (state.metrics.dashIndexCacheHits || 0) + 1;
+        const from = Math.round((start - cached.start) * TARGET_SAMPLE_RATE);
+        const to = from + Math.round((end - start) * TARGET_SAMPLE_RATE);
+        return { start, end, audio: cached.audio.slice(from, to), complete: end >= index.duration - 0.001 };
+      }
+    }
+    const { samples, rate, editOffset } = index;
+    // The timestamps are ordered; include 4 AAC access units for decoder preroll.
+    let low = 0, high = samples.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if ((samples[middle].cts + samples[middle].duration - editOffset) / rate <= start) low = middle + 1;
+      else high = middle;
+    }
+    const first = Math.max(0, low - 4);
+    let last = Math.max(first, low);
+    while (last < samples.length && (samples[last].cts - editOffset) / rate < end) last += 1;
+    if (last <= first) return null;
+    const byteStart = samples[first].offset;
+    const byteEnd = samples[last - 1].offset + samples[last - 1].size - 1;
+    const windowBytes = byteEnd - byteStart + 1;
+    let actualAudioBytes = 0;
+    for (let i = first; i < last; i += 1) actualAudioBytes += samples[i].size;
+    if (windowBytes > DASH_INDEX_MAX_WINDOW_BYTES || windowBytes > actualAudioBytes * 10) {
+      throw engineError('MP4 分片过度交织，索引窗口范围过大', 'DIRECT_AUDIO_FAILED');
+    }
+    const part = await fetchExactRange(state, probe.candidate.url, byteStart, byteEnd, total, signal);
+    if (signal.aborted || disposed) throw engineError('索引窗口已取消', 'TASK_CANCELLED');
+    const decoded = [];
+    let sampleRate = 0;
+    let decoderFailure = null;
+    const decoder = new AudioDecoder({
+      output: data => {
+        try {
+          const frames = data.numberOfFrames;
+          const channels = data.numberOfChannels;
+          if (sampleRate && data.sampleRate !== sampleRate) throw new Error('采样率在窗口内变化');
+          sampleRate = data.sampleRate;
+          const mixed = new Float32Array(frames);
+          for (let ch = 0; ch < channels; ch += 1) {
+            const opts = { planeIndex: ch, format: 'f32-planar' };
+            const plane = new Float32Array(data.allocationSize(opts) / Float32Array.BYTES_PER_ELEMENT);
+            data.copyTo(plane, opts);
+            for (let i = 0; i < frames; i += 1) mixed[i] += plane[i] / channels;
+          }
+          decoded.push({ pts: data.timestamp / 1e6, audio: mixed });
+        } catch (error) { decoderFailure ||= error; }
+        finally { data.close(); }
+      },
+      error: error => { decoderFailure ||= error; }
+    });
+    try {
+      decoder.configure(index.config);
+      for (let i = first; i < last; i += 1) {
+        if (signal.aborted || disposed) throw engineError('索引窗口已取消', 'TASK_CANCELLED');
+        const sample = samples[i];
+        decoder.decode(new EncodedAudioChunk({ type: 'key',
+          timestamp: Math.round((sample.cts - editOffset) / rate * 1e6),
+          duration: Math.max(1, Math.round(sample.duration / rate * 1e6)),
+          data: new Uint8Array(part.buffer, sample.offset - byteStart, sample.size) }));
+        if (decoder.decodeQueueSize > 64) await decoder.flush();
+        if (decoderFailure) throw decoderFailure;
+      }
+      await decoder.flush();
+      if (decoderFailure) throw decoderFailure;
+      if (!sampleRate || !decoded.length) throw new Error('索引读取没有输出音频帧');
+      const size = Math.round((end - start) * sampleRate);
+      const output = new Float32Array(size);
+      let covered = 0;
+      for (const frame of decoded) {
+        const position = Math.round((frame.pts - start) * sampleRate);
+        const from = Math.max(0, -position);
+        const at = Math.max(0, position);
+        const length = Math.min(frame.audio.length - from, output.length - at);
+        if (length <= 0) continue;
+        if (at > covered + Math.round(sampleRate * 0.04)) throw new Error('索引音频存在超出容差的 PCM 时间空洞');
+        output.set(frame.audio.subarray(from, from + length), at);
+        covered = Math.max(covered, at + length);
+      }
+      if (covered < output.length - Math.round(sampleRate * 0.04)) throw new Error('索引音频尾部缺少 PCM');
+      if (signal.aborted || disposed) throw engineError('索引窗口已取消', 'TASK_CANCELLED');
+      const audio = sampleRate === TARGET_SAMPLE_RATE ? output : resampleTo16k(output, sampleRate);
+      downloaded += part.buffer.byteLength;
+      state.metrics.audioDownloadBytes = downloaded;
+      state.metrics.audioDownloadTotal = total;
+      state.metrics.dashIndexedWindows = (state.metrics.dashIndexedWindows || 0) + 1;
+      state.metrics.dashIndexedLastByteOffset = byteStart;
+      const cacheKey = `${start}:${end}`;
+      if (windowCache.has(cacheKey)) cacheBytes -= windowCache.get(cacheKey).audio.byteLength;
+      windowCache.delete(cacheKey);
+      windowCache.set(cacheKey, { start, end, audio });
+      cacheBytes += audio.byteLength;
+      while (windowCache.size > 3 || cacheBytes > 16 * 1024 * 1024) {
+        const oldest = windowCache.keys().next().value;
+        cacheBytes -= windowCache.get(oldest).audio.byteLength;
+        windowCache.delete(oldest);
+      }
+      state.metrics.dashIndexCacheBytes = cacheBytes;
+      // Return a copy: the voice-enhancement stage mutates PCM in place. Cache
+      // only the raw decoded source to prevent a double DSP pass on revisit.
+      return { start, end, audio: audio.slice(), complete: end >= index.duration - 0.001 };
+    } finally { try { decoder.close(); } catch {} }
+  };
+  const source = {
+    kind: 'dash-indexed', duration: index.duration, timelineOffset: 0, complete: false,
+    readWindow,
+    cancelWindow: () => { controller.abort('seek-replaced'); controller = new AbortController(); },
+    dispose: () => { disposed = true; controller.abort('session-finished'); windowCache.clear();
+      state.metrics.dashIndexCacheBytes = 0;
+      if (state.hlsHeaderLease) { state.hlsHeaderLease = false; void releaseDirectRequestHeaders(state); } }
+  };
+  source.initialWindow = await readWindow(Number(state.directStartTime) || 0, HLS_STARTUP_SECONDS);
+  if (!source.initialWindow) throw new Error('索引位置超过音轨末尾');
+  state.metrics.dashIndexed = true;
+  state.metrics.dashIndexSamples = index.samples.length;
+  state.metrics.dashIndexHeaderBytes = headerBytes;
+  return source;
 }
 
 function mp4AudioDecoderConfig(file, track) {
@@ -2060,6 +2335,9 @@ async function downloadProgressiveMp4Audio(state, probe) {
   }
   const file = self.MP4Box.createFile();
   const decodedChunks = [];
+  // Cumulative exclusive frame offsets provide O(log n + window chunks) random
+  // access even when a long DASH track has tens of thousands of AudioData blocks.
+  const decodedChunkEnds = [];
   let decodedFrames = 0;
   let decodedSampleRate = 0;
   let nextAudioPts = null;
@@ -2111,7 +2389,7 @@ async function downloadProgressiveMp4Audio(state, probe) {
     const start = Math.max(0, target - 1);
     const fromFrame = Math.round(start * decodedSampleRate);
     const toFrame = Math.min(decodedFrames, Math.round(end * decodedSampleRate));
-    const mixed = sliceDecodedPcm(decodedChunks, fromFrame, toFrame);
+    const mixed = sliceDecodedPcm(decodedChunks, fromFrame, toFrame, decodedChunkEnds);
     const audio = decodedSampleRate === TARGET_SAMPLE_RATE ? mixed : resampleTo16k(mixed, decodedSampleRate);
     return { start: fromFrame / decodedSampleRate, end: toFrame / decodedSampleRate,
       complete: fullSettled && toFrame === decodedFrames, audio };
@@ -2165,6 +2443,7 @@ async function downloadProgressiveMp4Audio(state, probe) {
       if (strongestPlane && rmsOf(mixed) ** 2 * frames < strongestEnergy * 0.25) mixed.set(strongestPlane.subarray(0, frames));
       decodedChunks.push(mixed);
       decodedFrames += frames;
+      decodedChunkEnds.push(decodedFrames);
       state.metrics.dashRetainedPcmBytes = decodedFrames * Float32Array.BYTES_PER_ELEMENT;
       maybeResolveStartup();
       wakeReaders();
@@ -2273,7 +2552,7 @@ async function downloadProgressiveMp4Audio(state, probe) {
   return {
     kind: 'dash-progressive', initialAudio, fullAudioPromise, readWindow,
     cancelWindow: () => { windowController.abort(); windowController = new AbortController(); },
-    dispose: () => { disposed = true; windowController.abort(); wakeReaders(); decodedChunks.length = 0;
+    dispose: () => { disposed = true; windowController.abort(); wakeReaders(); decodedChunks.length = 0; decodedChunkEnds.length = 0;
       state.metrics.dashRetainedPcmBytes = 0; try { decoder?.close(); } catch {} },
     // Network completion is not PCM completeness: initialAudio may still be
     // only the startup prefix even if the full promise resolved in this tick.
@@ -2281,16 +2560,30 @@ async function downloadProgressiveMp4Audio(state, probe) {
   };
 }
 
-function sliceDecodedPcm(chunks, fromFrame, toFrame) {
+function sliceDecodedPcm(chunks, fromFrame, toFrame, chunkEnds = null) {
   const output = new Float32Array(Math.max(0, toFrame - fromFrame));
+  if (!output.length) return output;
+  let startChunk = 0;
   let offset = 0;
+  if (chunkEnds && chunkEnds.length === chunks.length) {
+    // Exclusive ends are sorted; seek directly to the block containing fromFrame.
+    let low = 0;
+    let high = chunkEnds.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (chunkEnds[mid] <= fromFrame) low = mid + 1;
+      else high = mid;
+    }
+    startChunk = low;
+    offset = startChunk ? chunkEnds[startChunk - 1] : 0;
+  }
   let written = 0;
-  for (const chunk of chunks) {
+  for (let index = startChunk; index < chunks.length && offset < toFrame; index += 1) {
+    const chunk = chunks[index];
     const from = Math.max(0, fromFrame - offset);
     const to = Math.min(chunk.length, toFrame - offset);
     if (to > from) { output.set(chunk.subarray(from, to), written); written += to - from; }
     offset += chunk.length;
-    if (offset >= toFrame) break;
   }
   if (written !== output.length) throw new Error('DASH 解码窗口存在 PCM 缺口');
   return output;
@@ -2425,7 +2718,12 @@ function rejectPageFetchWaiters(state, error) {
 }
 
 async function fetchResource(state, url, maxBytes = 64 * 1024 * 1024, options = {}) {
-  const { resourceKind = '分片/初始化段', ...requestOptions } = options;
+  const { resourceKind = '分片/初始化段', range = null, ...requestOptions } = options;
+  if (range && (!Number.isSafeInteger(range.offset) || range.offset < 0 ||
+      !Number.isSafeInteger(range.length) || range.length < 1 || range.length > maxBytes ||
+      !Number.isSafeInteger(range.offset + range.length - 1))) {
+    throw new Error('不安全的 HTTP BYTERANGE 请求');
+  }
   const pageEligible = /^https?:/i.test(url);
   const routeKey = pageEligible ? `${Number(state.pageFetchFrameId) || 0}:${new URL(url).origin}` : '';
   state.resourceFetchRoutes ||= new Map();
@@ -2447,19 +2745,34 @@ async function fetchResource(state, url, maxBytes = 64 * 1024 * 1024, options = 
         throw engineError('前瞻窗口已取消', 'TASK_CANCELLED');
       }
       request = await openSessionFetch(state, url, { cache: 'no-store', credentials: 'include', redirect: 'follow',
-        stallTimeoutMs: 20000, ...requestOptions });
+        stallTimeoutMs: 20000, ...requestOptions,
+        headers: { ...(requestOptions.headers || {}), ...(range
+          ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {}) } });
       const response = request.response;
+      if (range) {
+        const header = response.headers.get('content-range') || '';
+        const match = header.match(/^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i);
+        if (response.status !== 206 || !match || Number(match[1]) !== range.offset ||
+          Number(match[2]) !== range.offset + range.length - 1 ||
+          (match[3] !== '*' && Number(match[3]) <= Number(match[2]))) {
+          throw new Error(`服务器未按要求返回精确 206 BYTERANGE：${header || response.status}`);
+        }
+      }
       if (!response.ok) throw new Error(`HTTP ${response.status}${state.metrics.hlsRefererError ? `（Referer：${state.metrics.hlsRefererError}）` : ''}`);
       const declared = Number(response.headers.get('content-length')) || 0;
       if (declared > maxBytes) throw new Error(`资源超过 ${(maxBytes / 1024 / 1024).toFixed(0)} MiB 限制`);
-      return await readSessionResponse(request, maxBytes);
+      const data = await readSessionResponse(request, range ? range.length : maxBytes);
+      if (range && data.byteLength !== range.length) throw new Error('BYTERANGE 实际数据长度与清单不一致');
+      return data;
     } finally {
       request?.close();
       if (lease?.ok) await chrome.runtime.sendMessage({ target: 'background', type: 'BILI_ASR_MEDIA_HEADERS_RELEASE',
         sessionId: state.sessionId, ruleId: lease.ruleId }).catch(() => {});
     }
   };
-  const routes = !pageEligible ? ['extension'] : preferPage ? ['page', 'extension'] : ['extension', 'page'];
+  // The page-world bridge has no Range header support; never mistake its full
+  // 200 response for the requested partial audio segment.
+  const routes = range || !pageEligible ? ['extension'] : preferPage ? ['page', 'extension'] : ['extension', 'page'];
   const failures = [];
   for (const route of routes) {
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -2602,17 +2915,17 @@ function assembleHlsAudio(format, initBuffer, segmentBuffers) {
   return { buffer: joinByteArrays(chunks), codec: format };
 }
 
-async function downloadHlsAudio(state, manifestUrl) {
-  state.statusText = '正在解析 HLS 音轨并定位当前播放位置…';
+async function downloadHlsAudio(state, manifestUrl, presetPlaylist = null) {
+  const isDash = Boolean(presetPlaylist?.dash);
+  state.statusText = `正在解析 ${isDash ? 'DASH' : 'HLS'} 音轨并定位当前播放位置…`;
   sendEvent(state, 'status');
-  const playlist = await resolveHlsMediaPlaylist(state, manifestUrl);
+  const playlist = presetPlaylist || await resolveHlsMediaPlaylist(state, manifestUrl);
   if (!playlist.endList) throw new Error('动态/直播 HLS 暂使用实时取音，不能预取尚未产生的音频');
-  if (playlist.unsupportedByteRange) throw new Error('当前 HLS 使用 BYTERANGE，尚未接入范围分片读取');
-  if (!playlist.segments.length || playlist.segments.length > 10000) throw new Error('HLS 分片数量无效或超过 10000');
+  if (!playlist.segments.length || playlist.segments.length > 50000) throw new Error('HLS 分片数量无效或超过 50000');
   if (playlist.segments.some(segment => !(segment.duration > 0))) throw new Error('HLS 分片缺少有效时长，不能建立前瞻时间轴');
   const duration = playlist.segments.at(-1).end;
   validateDirectMediaDuration(duration, state.directSource?.duration, 'HLS 清单');
-  state.statusText = `HLS 点播清单已解析：${playlist.segments.length} 个分片，${duration.toFixed(1)} 秒；正在读取当前窗口。`;
+  state.statusText = `${isDash ? 'DASH' : 'HLS'} 点播清单已解析：${playlist.segments.length} 个分片，${duration.toFixed(1)} 秒；正在读取当前窗口。`;
   sendEvent(state, 'status');
   const keyCache = new Map();
   const cache = new Map();
@@ -2626,14 +2939,16 @@ async function downloadHlsAudio(state, manifestUrl) {
   };
   async function readResource(url, segment, signal) {
     assertActive(signal);
-    const id = JSON.stringify([url, segment?.key?.url || '', segment?.key?.iv || '', segment?.sequence ?? null]);
+    const id = JSON.stringify([url, segment?.range?.offset ?? null, segment?.range?.length ?? null,
+      segment?.key?.url || '', segment?.key?.iv || '', segment?.sequence ?? null]);
     if (cache.has(id)) {
       const buffer = cache.get(id);
       cache.delete(id);
       cache.set(id, buffer);
       return buffer;
     }
-    let buffer = await fetchResource(state, url, 32 * 1024 * 1024, { signal });
+    let buffer = await fetchResource(state, url, 32 * 1024 * 1024,
+      { signal, range: segment?.range || null });
     if (segment?.key) buffer = await decryptHlsSegment(state, segment, buffer, keyCache, signal);
     assertActive(signal);
     downloaded += buffer.byteLength;
@@ -2659,7 +2974,8 @@ async function downloadHlsAudio(state, manifestUrl) {
     const segments = playlist.segments.slice(plan.from, plan.to);
     const map = segments[0].initMap;
     if (map?.key && !map.key.iv) throw new Error('加密 HLS 初始化段必须有显式 IV');
-    const initBuffer = map ? await readResource(map.url, { key: map.key, sequence: playlist.mediaSequence }, signal) : null;
+    const initBuffer = map ? await readResource(map.url,
+      { key: map.key, range: map.range, sequence: playlist.mediaSequence }, signal) : null;
     const buffers = [];
     let bytes = initBuffer?.byteLength || 0;
     for (let from = 0; from < segments.length; from += concurrency) {
@@ -2674,16 +2990,16 @@ async function downloadHlsAudio(state, manifestUrl) {
     }
     const format = detectHlsFormat(initBuffer, buffers[0]);
     const assembled = assembleHlsAudio(format, initBuffer, buffers);
-    state.metrics.audioContainer = format === 'ts' ? `hls-ts-${assembled.codec}` : `hls-${format}`;
-    state.metrics.hlsSegmentsTotal = playlist.segments.length;
-    state.metrics.hlsWindowFrom = plan.from;
-    state.metrics.hlsWindowTo = plan.to;
+    state.metrics.audioContainer = format === 'ts' ? `hls-ts-${assembled.codec}` : `${isDash ? 'dash' : 'hls'}-${format}`;
+    state.metrics[isDash ? 'dashSegmentsTotal' : 'hlsSegmentsTotal'] = playlist.segments.length;
+    state.metrics[isDash ? 'dashWindowFrom' : 'hlsWindowFrom'] = plan.from;
+    state.metrics[isDash ? 'dashWindowTo' : 'hlsWindowTo'] = plan.to;
     state.metrics.hlsFetchConcurrency = concurrency;
     state.metrics.fetchedTo = plan.end;
     sendEvent(state, 'audio-progress', { audioLoaded: plan.to, audioTotal: playlist.segments.length });
     return { ...plan, buffer: assembled.buffer, timelineOffset: plan.start, format };
   }
-  const source = { kind: 'hls-windowed', duration, readWindow,
+  const source = { kind: isDash ? 'dash-windowed' : 'hls-windowed', duration, readWindow,
     cancelWindow: () => {
       controller.current.abort('window-replaced');
       controller.current = new AbortController();
@@ -2691,87 +3007,108 @@ async function downloadHlsAudio(state, manifestUrl) {
     dispose: () => { controller.current.abort('session-finished'); cache.clear(); keyCache.clear(); cacheBytes = 0;
       if (state.hlsHeaderLease) { state.hlsHeaderLease = false; void releaseDirectRequestHeaders(state); } }
   };
-  state.hlsSource = source;
+  if (isDash) state.dashSource = source;
+  else state.hlsSource = source;
   source.initialWindow = await readWindow(state.directStartTime, HLS_STARTUP_SECONDS);
   if (!source.initialWindow) throw new Error('当前播放位置已超过 HLS 音轨末尾');
-  state.metrics.hlsWindowed = true;
+  if (isDash) state.metrics.dashManifestWindowed = true;
+  else state.metrics.hlsWindowed = true;
   return source;
 }
 
-
-function directXmlChildren(node, localName) {
-  return [...(node?.children || [])].filter((child) => child.localName === localName || child.nodeName === localName);
+function dashDirectChildren(node, localName) {
+  return [...(node?.children || [])].filter((child) => String(child.localName || child.tagName || '').split(':').pop() === localName);
 }
 
-function dashNodeBase(node, parentBase) {
-  const base = directXmlChildren(node, 'BaseURL')[0]?.textContent?.trim();
-  if (!base) return parentBase;
-  try { return new URL(base, parentBase).href; } catch { return parentBase; }
+function dashFirstDirectChild(node, localName) {
+  return dashDirectChildren(node, localName)[0] || null;
 }
 
-function dashHasSegmentedAddressing(node) {
-  return directXmlChildren(node, 'SegmentTemplate').length > 0 || directXmlChildren(node, 'SegmentList').length > 0;
+function dashNodeValue(node, name, fallback = '') {
+  return String(node?.getAttribute?.(name) || fallback || '').trim();
 }
 
-async function resolveGenericDashAudioCandidates(state, manifestCandidate) {
-  state.statusText = '正在解析 DASH MPD 并寻找可直接读取的音频轨…';
+function dashResolvedBaseUrl(manifestUrl, nodes) {
+  let current = new URL(manifestUrl).href;
+  let changed = false;
+  for (const node of nodes) {
+    const base = dashFirstDirectChild(node, 'BaseURL');
+    const value = String(base?.textContent || '').trim();
+    if (!value) continue;
+    current = new URL(value, current).href;
+    changed = true;
+  }
+  return changed ? current : '';
+}
+
+// Conservative generic DASH support: many VOD MPDs ultimately point one audio
+// Representation at a complete MP4/WebM resource (often with SegmentBase/sidx).
+// Reuse the existing progressive decoder for those. SegmentTemplate/List needs
+// its own timeline/window planner, so do not guess URLs here.
+async function resolveSimpleDashAudioCandidate(state, manifestUrl) {
+  state.statusText = '正在解析 DASH MPD 并寻找可直接读取的独立音轨…';
   sendEvent(state, 'status');
-  const buffer = await fetchResource(state, manifestCandidate.url, 8 * 1024 * 1024, { resourceKind: 'DASH 清单' });
-  const xml = new TextDecoder().decode(buffer);
-  const document = new DOMParser().parseFromString(xml, 'application/xml');
-  if (document.querySelector('parsererror')) throw new Error('DASH MPD XML 解析失败');
-  const mpd = document.documentElement;
-  if (!mpd || mpd.localName !== 'MPD') throw new Error('不是有效的 DASH MPD');
-  const mpdBase = dashNodeBase(mpd, manifestCandidate.url);
-  const output = [];
-  const seen = new Set();
-  const periods = directXmlChildren(mpd, 'Period');
+  const buffer = await fetchResource(state, manifestUrl, 8 * 1024 * 1024, { resourceKind: 'DASH 清单' });
+  const text = new TextDecoder().decode(buffer);
+  const xml = new DOMParser().parseFromString(text, 'application/xml');
+  if (xml.querySelector('parsererror')) throw new Error('DASH MPD XML 解析失败');
+  const mpd = xml.documentElement;
+  if (!mpd || String(mpd.localName || '').split(':').pop() !== 'MPD') throw new Error('响应不是有效的 DASH MPD');
+  if (dashNodeValue(mpd, 'type', 'static').toLowerCase() === 'dynamic') {
+    throw new Error('动态/直播 DASH 暂使用实时取音，未来分片尚未产生');
+  }
+  const periods = [...xml.getElementsByTagNameNS('*', 'Period')];
+  const choices = [];
   for (const period of periods) {
-    const periodBase = dashNodeBase(period, mpdBase);
-    for (const adaptation of directXmlChildren(period, 'AdaptationSet')) {
-      const adaptationBase = dashNodeBase(adaptation, periodBase);
-      const adaptationMime = String(adaptation.getAttribute('mimeType') || '');
-      const adaptationType = String(adaptation.getAttribute('contentType') || '');
-      const adaptationCodecs = String(adaptation.getAttribute('codecs') || '');
-      const protectedSet = adaptation.getElementsByTagName('ContentProtection').length > 0;
-      if (protectedSet) continue;
-      const adaptationSegmented = dashHasSegmentedAddressing(adaptation) || dashHasSegmentedAddressing(period);
-      for (const representation of directXmlChildren(adaptation, 'Representation')) {
-        const mimeType = String(representation.getAttribute('mimeType') || adaptationMime || '');
-        const codecs = String(representation.getAttribute('codecs') || adaptationCodecs || '');
-        const contentType = String(representation.getAttribute('contentType') || adaptationType || '');
-        const audioLike = contentType.toLowerCase() === 'audio' || /^audio\//i.test(mimeType) ||
-          /(?:mp4a|aac|opus|vorbis|ac-3|ec-3|flac)/i.test(codecs);
-        if (!audioLike || representation.getElementsByTagName('ContentProtection').length) continue;
-        // SegmentTemplate / SegmentList requires constructing many media URLs.
-        // Keep this resolver conservative and only hand complete/SegmentBase audio
-        // resources to the existing progressive range reader.
-        if (adaptationSegmented || dashHasSegmentedAddressing(representation)) continue;
-        const url = dashNodeBase(representation, adaptationBase);
-        if (!url || url === manifestCandidate.url || /\/$/.test(url) || seen.has(url)) continue;
-        seen.add(url);
-        output.push({
-          url,
-          kind: 'dash-audio',
-          source: 'dash-mpd',
-          frameId: Number(manifestCandidate.frameId) || 0,
-          mimeType,
-          codecs,
-          bitrate: Math.max(0, Number(representation.getAttribute('bandwidth')) || 0),
-          audioClass: 'standard',
-          identityConfidence: 'manifest-audio-representation'
-        });
+    for (const adaptation of dashDirectChildren(period, 'AdaptationSet')) {
+      const adaptationMime = dashNodeValue(adaptation, 'mimeType');
+      const adaptationType = dashNodeValue(adaptation, 'contentType').toLowerCase();
+      const representations = dashDirectChildren(adaptation, 'Representation');
+      for (const representation of representations) {
+        const mimeType = dashNodeValue(representation, 'mimeType', adaptationMime);
+        const codecs = dashNodeValue(representation, 'codecs', dashNodeValue(adaptation, 'codecs'));
+        const audioLike = adaptationType === 'audio' || /^audio\//i.test(mimeType) || /(?:mp4a|aac|opus|vorbis|ac-3|ec-3|flac)/i.test(codecs);
+        if (!audioLike) continue;
+        const protectedMedia = [period, adaptation, representation].some((node) => dashDirectChildren(node, 'ContentProtection').length);
+        choices.push({ period, adaptation, representation, mimeType, codecs, protectedMedia,
+          bandwidth: Math.max(0, Number(dashNodeValue(representation, 'bandwidth')) || 0) });
       }
     }
   }
-  output.sort((a, b) =>
-    Number(/audio\/mp4/i.test(b.mimeType || '')) - Number(/audio\/mp4/i.test(a.mimeType || '')) ||
-    Math.abs((Number(a.bitrate) || 128000) - 128000) - Math.abs((Number(b.bitrate) || 128000) - 128000));
-  state.metrics.genericDashRepresentations = output.length;
-  if (!output.length) {
-    throw new Error('MPD 没有发现可直接读取的完整/SegmentBase 音频 Representation；SegmentTemplate/List 暂回退实时取音');
+  if (!choices.length) throw new Error('DASH MPD 没有发现音频 Representation');
+  choices.sort((left, right) => Number(left.protectedMedia) - Number(right.protectedMedia) ||
+    Number(!/(?:mp4a|aac)/i.test(left.codecs)) - Number(!/(?:mp4a|aac)/i.test(right.codecs)) ||
+    (left.bandwidth || Number.MAX_SAFE_INTEGER) - (right.bandwidth || Number.MAX_SAFE_INTEGER));
+  const selected = choices[0];
+  if (selected.protectedMedia) throw new Error('DASH 音轨声明了 ContentProtection/DRM，不能在扩展侧直接解密');
+  const inheritance = [mpd, selected.period, selected.adaptation, selected.representation];
+  if (inheritance.some((node) => dashFirstDirectChild(node, 'SegmentTemplate'))) {
+    const playlist = self.BrowserDash.makePlaylist(xml, manifestUrl, selected);
+    return { url: manifestUrl, kind: 'dash-segment-plan', frameId: Number(state.pageFetchFrameId) || 0,
+      source: 'dash-template-audio', mimeType: selected.mimeType, codecs: selected.codecs,
+      bitrate: selected.bandwidth, playlist };
   }
-  return output;
+  if (inheritance.some((node) => dashFirstDirectChild(node, 'SegmentList'))) {
+    throw new Error('DASH SegmentList 尚不支持');
+  }
+  const url = dashResolvedBaseUrl(manifestUrl, inheritance);
+  if (!url || url === new URL(manifestUrl).href || /\/$/.test(new URL(url).pathname)) {
+    throw new Error('DASH 音频 Representation 没有可直接读取的完整资源 URL');
+  }
+  state.metrics.dashManifestResolved = true;
+  state.metrics.dashManifestAudioMime = selected.mimeType;
+  state.metrics.dashManifestAudioCodecs = selected.codecs;
+  state.statusText = `DASH MPD 已定位独立音轨：${selected.mimeType || '未知类型'} ${selected.codecs || ''}`.trim();
+  sendEvent(state, 'status');
+  return {
+    url,
+    kind: 'file',
+    frameId: Number(state.pageFetchFrameId) || 0,
+    mimeType: selected.mimeType,
+    codecs: selected.codecs,
+    bitrate: selected.bandwidth,
+    source: 'dash-manifest-audio'
+  };
 }
 
 async function downloadDirectAudio(state) {
@@ -2788,22 +3125,6 @@ async function downloadDirectAudio(state) {
     }
     let candidates = (state.directSource.candidates || []).filter(candidate =>
       !candidate.videoId || !state.directSource.videoId || candidate.videoId === state.directSource.videoId);
-    if (candidates.some((candidate) => candidate.kind === 'dash-manifest' || /\.mpd(?:$|[?#])/i.test(candidate.url || ''))) {
-      const expanded = [];
-      for (const candidate of candidates) {
-        if (!(candidate.kind === 'dash-manifest' || /\.mpd(?:$|[?#])/i.test(candidate.url || ''))) {
-          expanded.push(candidate);
-          continue;
-        }
-        state.pageFetchFrameId = Number(candidate.frameId) || 0;
-        try {
-          expanded.push(...await resolveGenericDashAudioCandidates(state, candidate));
-        } catch (error) {
-          errors.push(`${candidate.source || 'dash-manifest'}：${errorText(error)}`);
-        }
-      }
-      candidates = expanded;
-    }
     if (candidates.length) {
       selectedProbe = await selectBilibiliDashCandidate(state, candidates);
       state.metrics.dashCandidatesProbed = candidates.filter((candidate) => candidate?.kind === 'dash-audio').length;
@@ -2814,7 +3135,8 @@ async function downloadDirectAudio(state) {
         ? [selectedProbe.candidate, ...candidates.filter((candidate) => candidate !== selectedProbe.candidate)]
         : candidates;
     }
-    for (const candidate of candidates) {
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex];
     if (state.stopping || activeSession !== state) throw engineError('任务已停止', 'TASK_CANCELLED');
     if (candidate.videoId && state.directSource.videoId && candidate.videoId !== state.directSource.videoId) {
       errors.push('候选视频身份与当前播放器不一致，已丢弃');
@@ -2836,9 +3158,31 @@ async function downloadDirectAudio(state) {
     };
     state.pageFetchFrameId = Number(candidate.frameId) || 0;
     let buffer = null;
-    if (candidate.kind === 'dash-manifest' || /\.mpd(?:$|[?#])/i.test(candidate.url || '')) {
-      errors.push(`${candidateLabel}：DASH MPD 未解析出可直接读取的音频表示，改用实时取音`);
+    if (candidate.kind === 'dash-manifest' || (candidate.kind !== 'dash-segment-plan' && /\.mpd(?:$|[?#])/i.test(candidate.url || ''))) {
+      try {
+        const resolved = await resolveSimpleDashAudioCandidate(state, candidate.url);
+        if (!candidates.some((item) => item.url === resolved.url && item.kind === resolved.kind)) candidates.splice(candidateIndex + 1, 0, resolved);
+        else errors.push(`${candidateLabel}：MPD 解析出的音轨已在候选列表中`);
+      } catch (dashError) {
+        if (dashError?.code === 'TASK_CANCELLED') throw dashError;
+        errors.push(`${candidateLabel} DASH：${errorText(dashError)}`);
+      }
       continue;
+    }
+    if (candidate.kind === 'dash-segment-plan') {
+      try {
+        const dash = await downloadHlsAudio(state, candidate.url, candidate.playlist);
+        sniffCompleteAudioAsset(dash.initialWindow.buffer);
+        rememberCandidate();
+        if (headerRuleActive) { headerCleanupHandedOff = true; state.hlsHeaderLease = true; }
+        return dash;
+      } catch (dashError) {
+        state.dashSource?.dispose();
+        state.dashSource = null;
+        if (dashError?.code === 'TASK_CANCELLED') throw dashError;
+        errors.push(`${candidateLabel} DASH 分片：${errorText(dashError)}`);
+        continue;
+      }
     }
     if (candidate.kind === 'local-upload') {
       const token = String(candidate.token || candidate.url || '').replace(/^bscg-local:/, '');
@@ -2886,6 +3230,16 @@ async function downloadDirectAudio(state) {
       }
     }
     if (probe?.container === 'mp4' && (!candidate.audioClass || candidate.audioClass === 'standard')) {
+      try {
+        const indexed = await downloadIndexedMp4Audio(state, probe);
+        rememberCandidate();
+        if (headerRuleActive) { headerCleanupHandedOff = true; state.hlsHeaderLease = true; }
+        return indexed;
+      } catch (indexError) {
+        if (indexError?.code === 'TASK_CANCELLED') throw indexError;
+        errors.push(`${candidateLabel} MP4 随机访问索引：${errorText(indexError)}`);
+        state.metrics.dashIndexFallback = errorText(indexError);
+      }
       try {
         const progressive = await downloadProgressiveMp4Audio(state, probe);
         rememberCandidate();
@@ -3038,19 +3392,43 @@ function splitDirectAudio(audio, timelineOffset = 0, firstSample = 0, maxSeconds
 }
 
 function resetDirectSegmentsAt(state, startTime) {
+  const audio = state.directAudio;
   const timelineOffset = Math.max(0, Number(state.directAudioBaseTime) || 0);
-  const availableEnd = timelineOffset + (state.directAudio?.length || 0) / TARGET_SAMPLE_RATE;
+  const availableEnd = timelineOffset + (audio?.length || 0) / TARGET_SAMPLE_RATE;
   const wanted = Math.max(timelineOffset, Number(startTime) || timelineOffset);
-  if (!state.directAudio?.length || wanted >= availableEnd - 0.05) {
+  if (!audio?.length || wanted >= availableEnd - 0.05) {
     state.directSegments = [];
     state.directIndex = 0;
+    state.directFirstTrimSample = 0;
     return false;
   }
   const firstSample = Math.max(0, Math.round((wanted - timelineOffset) * TARGET_SAMPLE_RATE));
-  state.directSegments = splitDirectAudio(state.directAudio, timelineOffset, firstSample,
-    state.asrProfile === 'qwen3_asr_0_6b' ? MAX_PHRASE_SECONDS : SENSEVOICE_MAX_PHRASE_SECONDS);
-  state.directIndex = 0;
-  return state.directSegments.length > 0;
+  const maxSeconds = state.asrProfile === 'qwen3_asr_0_6b' ? MAX_PHRASE_SECONDS : SENSEVOICE_MAX_PHRASE_SECONDS;
+  // Reuse the already segmented suffix. A seek in the indexed region is
+  // O(log number-of-segments), with the first inferred chunk trimmed to the
+  // requested position; an uncached rewind builds a larger suffix once.
+  if (state.directSegmentAudio !== audio || state.directSegmentMaxSeconds !== maxSeconds ||
+      firstSample < (state.directSegmentBaseSample || 0)) {
+    // Build only the necessary suffix on a first seek into a multi-hour track;
+    // subsequent forward seeks reuse it. A rewind beyond the indexed suffix
+    // expands the index backwards on demand.
+    state.directSegments = splitDirectAudio(audio, timelineOffset, firstSample, maxSeconds);
+    state.directSegmentAudio = audio;
+    state.directSegmentMaxSeconds = maxSeconds;
+    state.directSegmentBaseSample = firstSample;
+    state.metrics.directSegmentBuilds = (state.metrics.directSegmentBuilds || 0) + 1;
+  }
+  const segments = state.directSegments;
+  let low = 0;
+  let high = segments.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (segments[middle].toSample <= firstSample) low = middle + 1;
+    else high = middle;
+  }
+  state.directIndex = low;
+  state.directFirstTrimSample = firstSample;
+  return low < segments.length;
 }
 
 function activateLowLevelDirectSegments(state, rejectDigitalSilence = false) {
@@ -3138,19 +3516,21 @@ function dispatchNextDirectSegment(state) {
   while (state.directIndex < state.directSegments.length) {
     if (state.rollingLookahead && state.directCompletedThrough - estimateVideoTime(state) >= targetAhead) return;
     const segment = state.directSegments[state.directIndex++];
+    const trimmedStart = Math.max(segment.fromSample, state.directFirstTrimSample || 0);
+    state.directFirstTrimSample = 0;
     if (segment.silent) {
       state.directCompletedThrough = segment.endVideo;
       state.metrics.recognizedTo = state.directCompletedThrough;
       maybeResumeDirectPlayback(state);
       continue;
     }
-    const audio = state.directAudio.slice(segment.fromSample, segment.toSample);
+    const audio = state.directAudio.slice(trimmedStart, segment.toSample);
     state.directAttemptedSegments += 1;
     const phraseId = ++state.phraseSequence;
     const audioSeconds = audio.length / TARGET_SAMPLE_RATE;
     state.pending.set(phraseId, {
       phraseId,
-      startVideo: segment.startVideo,
+      startVideo: state.directAudioBaseTime + trimmedStart / TARGET_SAMPLE_RATE,
       endVideo: segment.endVideo,
       audioSeconds,
       reason: segment.boundary || 'direct-track',
@@ -3202,6 +3582,8 @@ function dispatchNextDirectSegment(state) {
       return;
     }
     state.directAudio = null;
+    state.directSegmentAudio = null;
+    state.hlsDecodedWindowCache?.clear();
     state.hlsSource?.dispose();
     state.dashSource?.dispose();
     finalizeStopped(state, 'direct-complete');
@@ -3209,10 +3591,11 @@ function dispatchNextDirectSegment(state) {
 }
 
 function prefetchHlsWindow(state) {
-  if (!state.hlsSource || state.stopping || state.hlsWindowComplete || state.hlsPrefetch || state.hlsLoadingGeneration === state.directGeneration) return;
+  const source = state.hlsSource || (state.dashSource?.kind === 'dash-windowed' ? state.dashSource : null);
+  if (!source || state.stopping || state.hlsWindowComplete || state.hlsPrefetch || state.hlsLoadingGeneration === state.directGeneration) return;
   const time = state.hlsWindowEnd;
   const generation = state.directGeneration;
-  const promise = state.hlsSource.readWindow(time);
+  const promise = source.readWindow(time);
   void promise.catch(() => {});
   state.hlsPrefetch = { time, generation, promise };
 }
@@ -3226,13 +3609,45 @@ async function decodeHlsWindow(state, window) {
   }
   if (!state.metrics.hlsDecodedNotice) {
     state.metrics.hlsDecodedNotice = true;
-    state.statusText = `HLS 前瞻取音已就绪：${window.start.toFixed(1)}–${window.end.toFixed(1)} 秒，` +
+    state.statusText = `${state.dashSource?.kind === 'dash-windowed' ? 'DASH' : 'HLS'} 前瞻取音已就绪：${window.start.toFixed(1)}–${window.end.toFixed(1)} 秒，` +
       `PCM ${seconds.toFixed(1)} 秒；扩展直取 ${state.metrics.resourceExtensionReads || 0} 次，页面代理 ${state.metrics.resourcePageReads || 0} 次。`;
     sendEvent(state, 'status');
   }
   // Decoder padding must not accumulate at successive window boundaries.
   return audio.length > Math.round(expected * TARGET_SAMPLE_RATE)
     ? audio.slice(0, Math.round(expected * TARGET_SAMPLE_RATE)) : audio;
+}
+
+function rememberDecodedHlsWindow(state, window, audio) {
+  const entries = state.hlsDecodedWindowCache ||= new Map();
+  const key = `${window.start}:${window.end}`;
+  entries.delete(key);
+  entries.set(key, { start: window.start, end: window.end, complete: window.complete, audio });
+  let bytes = 0;
+  for (const item of entries.values()) bytes += item.audio.byteLength;
+  // Bounded backward-seek cache: no more than 3 windows or 16 MiB of PCM.
+  while (entries.size > 3 || bytes > 16 * 1024 * 1024) {
+    const oldest = entries.keys().next().value;
+    const entry = entries.get(oldest);
+    if (entries.size === 1) break;
+    entries.delete(oldest);
+    bytes -= entry.audio.byteLength;
+  }
+  state.metrics.hlsDecodedCacheBytes = bytes;
+}
+
+function findDecodedHlsWindow(state, time) {
+  const entries = state.hlsDecodedWindowCache;
+  if (!entries?.size) return null;
+  for (const [key, entry] of entries) {
+    if (time >= entry.start && time < entry.end - 0.05) {
+      entries.delete(key);
+      entries.set(key, entry);
+      state.metrics.hlsDecodedCacheHits = (state.metrics.hlsDecodedCacheHits || 0) + 1;
+      return entry;
+    }
+  }
+  return null;
 }
 
 async function loadNextHlsWindow(state, requestedTime = null) {
@@ -3244,11 +3659,12 @@ async function loadNextHlsWindow(state, requestedTime = null) {
   state.hlsLoadingGeneration = generation;
   const time = Math.max(0, requestedTime ?? Math.max(state.directCompletedThrough, estimateVideoTime(state)));
   try {
+    const cached = ['hls-windowed', 'dash-windowed'].includes(source.kind) ? findDecodedHlsWindow(state, time) : null;
     const prefetched = state.hlsPrefetch;
     state.hlsPrefetch = null;
-    const usePrefetch = prefetched?.generation === generation && time >= prefetched.time && time < prefetched.time + HLS_WINDOW_SECONDS;
+    const usePrefetch = !cached && prefetched?.generation === generation && time >= prefetched.time && time < prefetched.time + HLS_WINDOW_SECONDS;
     if (prefetched && !usePrefetch) source.cancelWindow();
-    const window = await (usePrefetch ? prefetched.promise : source.readWindow(time));
+    const window = cached || await (usePrefetch ? prefetched.promise : source.readWindow(time));
     if (activeSession !== state || state.stopping || generation !== state.directGeneration) return;
     if (!window) {
       state.directSourceComplete = true;
@@ -3258,8 +3674,10 @@ async function loadNextHlsWindow(state, requestedTime = null) {
     }
     const audio = window.audio || await decodeHlsWindow(state, window);
     if (activeSession !== state || state.stopping || generation !== state.directGeneration) return;
-    await processDirectVoiceBuffer(state, audio, true);
+    // Cached PCM was already voice-processed; processing it twice is audible.
+    if (!cached) await processDirectVoiceBuffer(state, audio, true);
     if (activeSession !== state || state.stopping || generation !== state.directGeneration) return;
+    if (!cached && state.hlsSource) rememberDecodedHlsWindow(state, window, audio);
     state.directAudio = audio;
     state.directAudioBaseTime = window.start;
     state.hlsWindowEnd = window.end;
@@ -3398,8 +3816,11 @@ async function beginDirectSession(message) {
       if (activeSession !== state || state.stopping) return;
       Object.assign(state.metrics, metrics || {});
       const progressiveHls = source?.kind === 'hls-windowed';
+      const progressiveIndexed = source?.kind === 'dash-indexed';
+      const dashManifestWindowed = source?.kind === 'dash-windowed';
+      const progressiveWindowed = progressiveHls || progressiveIndexed || dashManifestWindowed;
       const progressiveDash = source?.kind === 'dash-progressive';
-      const progressive = progressiveHls || progressiveDash;
+      const progressive = progressiveWindowed || progressiveDash;
       state.directDuration = progressive ? Math.max(0, Number(source.duration) || 0) : 0;
       state.directSourceComplete = !progressive || Boolean(source.complete);
       try {
@@ -3413,14 +3834,15 @@ async function beginDirectSession(message) {
           state.metrics.capturedAudioSeconds = state.directAudio.length / TARGET_SAMPLE_RATE;
           state.metrics.directDecodedSeconds = state.metrics.capturedAudioSeconds;
           state.metrics.directAudioRms = rmsOf(state.directAudio);
-        } else if (progressiveHls) {
+        } else if (progressiveWindowed) {
+          if (progressiveIndexed || dashManifestWindowed) state.dashSource = source;
           let window = source.initialWindow;
           for (;;) {
             const generation = state.directGeneration;
             const time = state.directStartTime;
             if (!window || time < window.start || time >= window.end) window = await source.readWindow(time, HLS_STARTUP_SECONDS);
             if (!window) throw engineError('HLS 跳转位置超过音轨末尾', 'DIRECT_AUDIO_FAILED');
-            const audio = await decodeHlsWindow(state, window);
+            const audio = window.audio || await decodeHlsWindow(state, window);
             if (activeSession !== state || state.stopping) return;
             if (generation !== state.directGeneration) { window = null; continue; }
             state.directAudio = audio;
@@ -3446,17 +3868,22 @@ async function beginDirectSession(message) {
         throw withErrorCode(error, 'AUDIO_PROCESSING_FAILED');
       }
       if (activeSession !== state || state.stopping) return;
+      if (progressiveHls || dashManifestWindowed) rememberDecodedHlsWindow(state, {
+        start: Number(source.timelineOffset) || 0,
+        end: state.hlsWindowEnd,
+        complete: state.hlsWindowComplete
+      }, state.directAudio);
       state.directAudioBaseTime = progressive ? Number(source.timelineOffset) || 0 : 0;
       state.directDuration = Math.max(state.directDuration, state.directAudioBaseTime + state.directAudio.length / TARGET_SAMPLE_RATE);
       state.directCompletedThrough = state.directStartTime;
-      if (progressiveHls && (state.directStartTime < state.directAudioBaseTime ||
+      if (progressiveWindowed && (state.directStartTime < state.directAudioBaseTime ||
           state.directStartTime >= state.directAudioBaseTime + state.directAudio.length / TARGET_SAMPLE_RATE)) {
         state.directStarted = true;
         state.directSourceComplete = false;
         void loadNextHlsWindow(state, state.directStartTime);
         return;
       }
-      if (state.directSourceComplete && !progressiveHls) {
+      if (state.directSourceComplete && !progressiveWindowed) {
         prepareCompleteDirectSegments(state, state.directStartTime);
       } else {
         resetDirectSegmentsAt(state, state.directStartTime);
@@ -3466,11 +3893,11 @@ async function beginDirectSession(message) {
       state.metrics.directExpectedSeconds = Math.max(0, Number(state.directSource.duration) || Number(source?.duration) || 0);
       state.status = 'running';
       state.statusText = progressive && !state.directSourceComplete
-        ? `${progressiveDash ? 'DASH' : 'HLS'} 首批 ${state.metrics.capturedAudioSeconds.toFixed(1)} 秒已就绪；立即开始识别，剩余音频后台续取${voiceControlLabel(state)}。`
+        ? `${progressiveHls ? 'HLS' : 'DASH'} 首批 ${state.metrics.capturedAudioSeconds.toFixed(1)} 秒已就绪；立即开始识别，剩余音频后台续取${voiceControlLabel(state)}。`
         : `独立音轨已解码为 ${state.metrics.capturedAudioSeconds.toFixed(1)} 秒；开始离线前瞻识别${voiceControlLabel(state)}。`;
       sendEvent(state, 'direct-ready');
       dispatchNextDirectSegment(state);
-      if (progressiveHls && !state.directSourceComplete) prefetchHlsWindow(state);
+      if ((progressiveHls || dashManifestWindowed) && !state.directSourceComplete) prefetchHlsWindow(state);
       if (progressiveDash && !state.directSourceComplete) void finishProgressiveDash(state, source);
     } catch (error) {
       if (activeSession === state && !state.stopping) await failSession(state, error);
@@ -3523,6 +3950,7 @@ function seekDirectSession(message) {
     state.directIndex = 0;
     state.directSourceComplete = false;
     state.directAudio = null;
+    state.directSegmentAudio = null;
     state.directCompletedThrough = startTime;
     void loadNextHlsWindow(state, startTime);
     return { ok: true, currentTime: startTime, waitingForSource: true };
@@ -3978,6 +4406,9 @@ function finalizeStopped(state, reason = state?.stopReason || 'user') {
   try { state.networkController?.abort('session-finished'); } catch {}
   state.hlsSource?.dispose();
   state.dashSource?.dispose();
+  state.directAudio = null;
+  state.directSegmentAudio = null;
+  state.hlsDecodedWindowCache?.clear();
   cancelInitialization('识别任务已结束，模型初始化已回收', state.sessionId);
   if (state.metricTimer) clearInterval(state.metricTimer);
   state.status = 'stopped';
@@ -4014,6 +4445,8 @@ async function failSession(state, error) {
   if (state.metricTimer) clearInterval(state.metricTimer);
   await stopAudioGraph(state);
   state.directAudio = null;
+  state.directSegmentAudio = null;
+  state.hlsDecodedWindowCache?.clear();
   state.status = 'error';
   state.statusText = '浏览器本地识别失败。';
   Object.assign(state.metrics, visibleHeap());

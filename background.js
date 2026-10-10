@@ -12,9 +12,8 @@ const {
 
 async function translateWithConfiguredModel(config, lines) {
   try {
-    if (config.abortSignal?.aborted) throw new Error('翻译已取消');
     if (config.mode !== 'onnx') {
-      const result = await translateLines(config, lines, config.abortSignal || null);
+      const result = await translateLines(config, lines);
       if (result.ok) BSCG_TRANSLATION_PERFORMANCE.validate(config, result.texts, lines.length);
       return result;
     }
@@ -23,7 +22,6 @@ async function translateWithConfiguredModel(config, lines) {
       sourceLanguage: config.sourceLanguage, targetLanguage: config.targetLanguage, lines,
       realtime: Boolean(config.realtime), qualityRetry: Boolean(config.qualityRetry)
     });
-    if (config.abortSignal?.aborted) throw new Error('翻译已取消');
     if (!response?.ok) throw new Error(response?.error || 'ONNX 翻译失败');
     const texts = Array.isArray(response.texts) ? response.texts
       : parseTranslatedLines(response.content, lines.length);
@@ -317,41 +315,33 @@ function currentDocumentId(tabId, fallback = '') {
   return String(normalized || documentByTab.get(Number(tabId)) || '');
 }
 
-function responseHeader(details, name) {
-  const wanted = String(name || '').toLowerCase();
-  const entry = (details?.responseHeaders || []).find((header) => String(header?.name || '').toLowerCase() === wanted);
-  return String(entry?.value || '').trim();
-}
-
 function rememberObservedMedia(details) {
   const tabId = Number(details?.tabId);
   const rawUrl = String(details?.url || '');
   if (tabId < 0 || !/^https?:/i.test(rawUrl)) return;
   if (Number(details.frameId) === 0 && details.documentId && currentDocumentId(tabId) &&
       details.documentId !== currentDocumentId(tabId)) return;
-  const responseType = responseHeader(details, 'content-type').split(';')[0].trim().toLowerCase();
+  const hintedKind = String(details?._bscgKind || '');
+  const hintedMimeType = String(details?._bscgMimeType || '');
   const isYouTubeMedia = /(?:^|\.)googlevideo\.com\/videoplayback/i.test(rawUrl);
-  const hlsByType = /mpegurl|vnd\.apple\.mpegurl/i.test(responseType);
-  const dashByType = /dash\+xml/i.test(responseType);
-  const isManifest = /\.(?:m3u8|mpd)(?:$|[?#])/i.test(rawUrl) || hlsByType || dashByType;
+  const isManifest = ['hls', 'dash'].includes(hintedKind) || /\.(?:m3u8|mpd)(?:$|[?#])/i.test(rawUrl);
   const isFragment = /\.(?:m4s|cmfa|cmfv|ts)(?:$|[?#])/i.test(rawUrl);
   const isMediaFile = /\.(?:mp4|m4a|m4v|mov|webm|mp3|aac|ogg|opus|flac|wav)(?:$|[?#])/i.test(rawUrl);
-  const mediaByType = /^(?:audio|video)\//i.test(responseType) || /^(?:application\/mp4|application\/ogg)$/i.test(responseType);
   let isBilibiliFragment = false;
   try {
     const hostname = new URL(rawUrl).hostname;
     isBilibiliFragment = isFragment && /(^|\.)(?:bilivideo|hdslb)\.com$/i.test(hostname);
   } catch {}
   const isMediaRequest = details?.type === 'media' && !isFragment;
-  if (!isYouTubeMedia && !isManifest && !isMediaFile && !isMediaRequest && !isBilibiliFragment && !mediaByType) return;
+  if (!isYouTubeMedia && !isManifest && !isMediaFile && !isMediaRequest && !isBilibiliFragment) return;
   let url = rawUrl;
   let canonicalUrl = rawUrl;
-  let mimeType = responseType;
+  let mimeType = hintedMimeType;
   let bitrate = 0;
   try {
     const parsed = new URL(rawUrl);
     if (isYouTubeMedia) {
-      mimeType = decodeURIComponent(parsed.searchParams.get('mime') || '') || mimeType;
+      mimeType = decodeURIComponent(parsed.searchParams.get('mime') || '');
       bitrate = Number(parsed.searchParams.get('bitrate')) || 0;
       // 用去掉瞬时 Range 参数的地址去重，但保留播放器真实发出的签名 URL 供下载。
       // 某些 GoogleVideo 签名会覆盖查询参数，改写实际请求可能直接导致 403。
@@ -360,9 +350,7 @@ function rememberObservedMedia(details) {
     }
   } catch {}
   const records = observedMediaByTab.get(tabId) || [];
-  const kind = isManifest
-    ? (dashByType || /\.mpd(?:$|[?#])/i.test(rawUrl) ? 'dash' : 'hls')
-    : isBilibiliFragment ? 'fragment' : 'media';
+  const kind = hintedKind || (isManifest ? (/\.mpd(?:$|[?#])/i.test(rawUrl) ? 'dash' : 'hls') : isBilibiliFragment ? 'fragment' : 'media');
   const key = `${kind}\n${canonicalUrl}`;
   const next = records.filter((entry) => entry.key !== key);
   next.push({
@@ -388,11 +376,20 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] }
 );
 
-// URL suffixes are not enough for modern MSE players: manifests and audio can
-// be extensionless or fetched from workers. Classify the response once headers
-// are available, similar to media-sniffer extensions, without changing requests.
-chrome.webRequest.onResponseStarted.addListener(
-  rememberObservedMedia,
+// URL 没有 .m3u8/.mpd 后缀时，onBeforeRequest 无法知道它是不是清单。
+// 现代播放器很常见这种签名/无后缀地址；从响应 Content-Type 再补记一次，
+// 也能覆盖一部分在 Worker 中发起、MAIN world fetch/XHR hook 看不到的请求。
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const type = String((details.responseHeaders || []).find((header) =>
+      String(header.name || '').toLowerCase() === 'content-type')?.value || '').toLowerCase();
+    let kind = '';
+    if (/mpegurl/.test(type)) kind = 'hls';
+    else if (/dash\+xml/.test(type)) kind = 'dash';
+    else if (/^audio\//.test(type) || /^video\//.test(type)) kind = 'media';
+    if (!kind) return;
+    rememberObservedMedia({ ...details, _bscgKind: kind, _bscgMimeType: type });
+  },
   { urls: ['http://*/*', 'https://*/*'], types: ['media', 'xmlhttprequest', 'other'] },
   ['responseHeaders']
 );
@@ -580,6 +577,7 @@ const DEFAULTS = {
   voiceEnhancePreset: 'balanced',
   autoCaptionsMainstream: false,
   autoCaptionsOther: false,
+  rememberCaptionSites: false,
   // 前瞻字幕翻译：只对音轨整轨前瞻（浏览器本地识别）的字幕段生效。
   // 本地默认指向本机 UNSLOTH Studio 的 OpenAI 兼容端点；远程走任意兼容服务。
   translateEnabled: false,
@@ -689,6 +687,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
       void chrome.alarms.clear(`bscg-job-expire:${key.slice(4)}`);
     }
   }
+});
+
+chrome.action.onClicked.addListener(async (tab) => {
+  // 本地视频页诊断：未开启“允许访问文件网址”时，点击工具栏图标直接跳到开关页。
+  if (tab?.url && /^file:/i.test(tab.url)) {
+    const allowed = await new Promise((resolve) => chrome.extension.isAllowedFileSchemeAccess(resolve));
+    if (!allowed) {
+      await chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` });
+      return;
+    }
+  }
+  chrome.runtime.openOptionsPage();
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -994,6 +1004,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     resolveRequestedTabId(message, sender).then((tabId) => getLiveUiState(tabId, message.pageUrl || '')).then(sendResponse).catch((error) => {
       sendResponse({ ok: false, error: error?.message || String(error) });
     });
+    return true;
+  }
+  if (message?.type === 'BSCG_CAPTION_SITE_CHOICE') {
+    rememberCaptionSiteChoice(message.pageUrl || sender.tab?.url || '', Boolean(message.enabled))
+      .then(sendResponse).catch((error) => sendResponse({ ok: false, error: error?.message || String(error) }));
     return true;
   }
   if (message?.type === 'BSCG_AUTO_START_CHECK') {
@@ -1905,14 +1920,11 @@ async function getGenericMediaSource(tabId) {
     func: bscgFindMedia, args: ['source']
   });
   return results.map(item => item.result ? { ...item.result, frameId: Number(item.frameId) || 0 } : null)
-    // Keep the frame that owns the active media even when its currentSrc is
-    // blob:/MediaSource. webRequest may know the real HLS/DASH/audio URL.
-    .filter(item => item && (item.mediaUrl || item.mediaSrc || Number(item.score) > 0))
-    .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] || null;
+    .filter(item => item?.mediaUrl).sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0] || null;
 }
 
 function genericReplayCandidates(generic, observed = []) {
-  if (!generic) return [];
+  if (!generic?.mediaUrl) return [];
   const candidates = [];
   const frameId = Math.max(0, Number(generic.frameId) || 0);
   const add = entry => {
@@ -1920,24 +1932,16 @@ function genericReplayCandidates(generic, observed = []) {
     candidates.push({ url: entry.url, kind: entry.kind === 'dash' ? 'dash-manifest' : entry.kind === 'hls' ? 'hls' : 'file',
       frameId, mimeType: entry.mimeType || '', bitrate: Number(entry.bitrate) || 0 });
   };
-  if (generic.mediaUrl) add({ url: generic.mediaUrl, kind: generic.kind || (generic.manifest ? 'hls' : 'media') });
+  add({ url: generic.mediaUrl, kind: generic.kind || (generic.manifest ? 'hls' : 'media') });
   for (const entry of generic.candidates || []) add(entry);
+  // 不再把网络观察候选限制在 blob/MSE 播放器。很多站点会给 video.currentSrc
+  // 一个可播放的 HTTP 地址，同时另外请求更适合 ASR 的 HLS/DASH 清单或独立 audio。
+  // 清单始终允许进入候选；额外 media 只接受 audio/*，避免把广告/预览视频大量塞进来。
   const blobBacked = /^blob:/i.test(generic.mediaSrc || '');
-  const noReadableSource = !generic.mediaUrl;
   for (const entry of observed) {
-    if (Number(entry.frameId) !== frameId) continue;
-    const mime = String(entry.mimeType || '');
-    // Network sniffing is intentionally bounded to the frame that owns the
-    // active media element. Extensionless HLS/DASH and audio are always useful.
-    // For blob/MSE players (or when currentSrc yielded no readable URL), also
-    // admit muxed MP4/WebM as a last-resort candidate; the engine range-probes
-    // the container before accepting it, so an unrelated preload normally dies
-    // here instead of being treated as the current video's audio.
-    const likelyMuxed = entry.kind === 'media' &&
-      /^(?:video\/(?:mp4|webm)|application\/mp4)$/i.test(mime);
-    const safeObserved = ['hls', 'dash'].includes(entry.kind) || /^audio\//i.test(mime) ||
-      (entry.kind === 'media' && blobBacked) || (noReadableSource && likelyMuxed);
-    if (safeObserved) add(entry);
+    if (Number(entry.frameId) !== frameId || !['hls', 'dash', 'media'].includes(entry.kind)) continue;
+    if (!blobBacked && entry.kind === 'media' && !/^audio\//i.test(entry.mimeType || '')) continue;
+    add(entry);
   }
   return candidates;
 }
@@ -2025,20 +2029,43 @@ async function getYouTubePlayerState(tabId, expectedVideoId) {
   if (!state.hasVideo) throw new Error('YouTube 播放器尚未加载，请稍后再试');
   if (state.responseVideoId !== expectedVideoId) throw new Error('YouTube 页面地址与播放器尚未同步，请稍后再试');
   const audioItags = new Set(['139', '140', '141', '249', '250', '251', '256', '258', '325', '328', '338', '599', '600']);
+  // Network records survive SPA navigation: itag alone cannot prove which
+  // video supplied the audio. Only reuse a recorded URL if the active player
+  // independently advertises the exact opaque media ID + itag combination.
+  const currentMediaIds = new Set((state.audioFormats || []).map((format) => {
+    try {
+      const u = new URL(format.url);
+      if (!/(^|\.)googlevideo\.com$/i.test(u.hostname)) return '';
+      const mediaId = u.searchParams.get('id');
+      const itag = u.searchParams.get('itag');
+      return mediaId && itag ? `${mediaId}:${itag}` : '';
+    } catch { return ''; }
+  }).filter(Boolean));
+  const unexpired = (value) => {
+    try {
+      const u = new URL(value);
+      if (!/(^|\.)googlevideo\.com$/i.test(u.hostname)) return false;
+      const expiry = Number(u.searchParams.get('expire'));
+      return !expiry || (Number.isSafeInteger(expiry) && expiry * 1000 > Date.now() + 60_000);
+    } catch { return false; }
+  };
   const observedAudio = (await getObservedMediaRecords(tabId)).map((entry) => {
     try {
       const parsed = new URL(entry.url);
       const mimeType = entry.mimeType || decodeURIComponent(parsed.searchParams.get('mime') || '');
       const itag = parsed.searchParams.get('itag') || '';
       if (!/^audio\//i.test(mimeType) && !audioItags.has(itag)) return null;
-      return { url: entry.url, bitrate: entry.bitrate || Number(parsed.searchParams.get('bitrate')) || 0, mimeType, source: 'webRequest' };
+      const mediaId = parsed.searchParams.get('id');
+      if (!mediaId || !currentMediaIds.has(`${mediaId}:${itag}`) || !unexpired(entry.url)) return null;
+      return { url: entry.url, bitrate: entry.bitrate || Number(parsed.searchParams.get('bitrate')) || 0,
+        mimeType, source: 'webRequest-matched-player' };
     } catch { return null; }
   }).filter(Boolean);
   const seenAudio = new Set();
   state.audioFormats = [...(state.audioFormats || []), ...observedAudio]
     .map((format) => ({ ...format, url: completeYouTubeAudioUrl(format.url) }))
     .filter((format) => {
-      if (!format?.url) return false;
+      if (!format?.url || !unexpired(format.url)) return false;
       let identity = format.url;
       try {
         const parsed = new URL(format.url);
@@ -2058,8 +2085,8 @@ async function getYouTubePlayerState(tabId, expectedVideoId) {
 function youTubeReplayCandidates(state) {
   const audio = (state.audioFormats || []).filter(format => format.url).map(format => ({
     ...format, url: completeYouTubeAudioUrl(format.url), kind: 'file', frameId: 0,
-    videoId: format.source === 'webRequest' ? '' : state.responseVideoId,
-    identityConfidence: format.source === 'webRequest' ? 'observed-in-tab' : 'player-response',
+    videoId: state.responseVideoId,
+    identityConfidence: format.source === 'webRequest-matched-player' ? 'matched-player-media-id' : 'player-response',
     source: format.source || 'youtube-audio'
   }));
   const muxed = (state.muxedFormats || []).filter(format => format.url &&
@@ -2070,50 +2097,82 @@ function youTubeReplayCandidates(state) {
   return audio.concat(muxed);
 }
 
-function selectYouTubeCaption(tracks, language) {
-  const wanted = language && language !== 'auto' ? language.toLowerCase() : '';
-  const languageMatches = (track, code) => {
-    const actual = String(track.languageCode || '').toLowerCase();
-    return actual === code || actual.startsWith(`${code}-`);
+function rankYouTubeCaptions(tracks, language) {
+  // YouTube's page player data is a best-effort source, not a public caption
+  // download API. Prefer requested-language human captions, but do not discard
+  // a usable second track when the first one is partial or expired.
+  const requested = String(language || '').toLowerCase();
+  const wanted = requested && requested !== 'auto' ? requested : '';
+  const lang = (track) => String(track?.languageCode || '').toLowerCase();
+  const matches = (actual, code) => Boolean(code && (actual === code || actual.startsWith(`${code}-`)));
+  const priority = (track) => {
+    const actual = lang(track);
+    const languagePriority = matches(actual, wanted) ? 0 : matches(actual, 'zh') ? 1 :
+      matches(actual, 'en') ? 2 : 3;
+    return languagePriority * 2 + (track.kind === 'asr' ? 1 : 0);
   };
-  return (wanted && tracks.find((track) => languageMatches(track, wanted))) ||
-    tracks.find((track) => languageMatches(track, 'zh')) ||
-    tracks.find((track) => !track.kind) || tracks[0] || null;
+  const seen = new Set();
+  return (Array.isArray(tracks) ? tracks : []).filter((track) => {
+    if (!track?.baseUrl || seen.has(track.baseUrl)) return false;
+    seen.add(track.baseUrl);
+    return true;
+  }).sort((a, b) => priority(a) - priority(b));
 }
 
 async function extractYouTubeRows(playerState, language) {
-  const selected = selectYouTubeCaption(playerState.captions || [], language);
-  if (!selected) return null;
-  const url = new URL(selected.baseUrl);
-  if (url.protocol !== 'https:' || !/(^|\.)youtube\.com$/i.test(url.hostname)) {
-    throw new Error('YouTube 返回了非预期字幕地址，已拒绝访问');
+  const tracks = rankYouTubeCaptions(playerState.captions, language);
+  if (!tracks.length) return null;
+  const videoDuration = Number(playerState?.lengthSeconds) || 0;
+  const attempts = Math.min(5, tracks.length);
+  for (const track of tracks.slice(0, attempts)) {
+    let response;
+    try {
+      const url = new URL(track.baseUrl);
+      if (url.protocol !== 'https:' || !/(^|\.)youtube\.com$/i.test(url.hostname)) {
+        pushLog('warn', '[youtube/cc] 字幕轨域名不符合预期，已跳过');
+        continue;
+      }
+      url.searchParams.set('fmt', 'json3');
+      response = await fetch(url.href, {
+        credentials: 'include', cache: 'no-store', signal: AbortSignal.timeout(10000)
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const subtitle = await response.json();
+      if (!Array.isArray(subtitle?.events)) throw new Error('字幕格式无效');
+      const rows = [];
+      const seen = new Set();
+      for (const event of subtitle.events.slice(0, 100000)) {
+        const from = Number(event.tStartMs) / 1000;
+        const length = Number(event.dDurationMs || 0) / 1000;
+        const content = (event.segs || []).map((segment) => segment.utf8 || '').join('').replace(/\s+/g, ' ').trim();
+        if (!content || !Number.isFinite(from) || !Number.isFinite(length) || from < 0 || length < 0) continue;
+        const to = from + length;
+        if (!Number.isFinite(to)) continue;
+        const key = `${from}:${to}:${content}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({ from, to, content });
+      }
+      if (!rows.length || !ccSubtitleFitsPart(rows, videoDuration)) {
+        pushLog('warn', `[youtube/cc] ${track.languageCode} 字幕为空或时间跨度不符，尝试其它轨道`);
+        continue;
+      }
+      const coverage = assessSubtitleCoverage(rows, videoDuration);
+      if (!coverage.usable) {
+        pushLog('warn', `[youtube/cc] ${track.languageCode} 轨道覆盖不足 (${(coverage.covered * 100).toFixed(1)}%)，尝试其它轨道`);
+        continue;
+      }
+      rows.sort((a, b) => a.from - b.from || a.to - b.to);
+      const automatic = track.kind === 'asr' ? '自动字幕' : '字幕';
+      const label = `YouTube ${automatic} ${track.languageCode || ''}${track.name ? `（${track.name}）` : ''}`;
+      if (track !== tracks[0]) pushLog('info', `[youtube/cc] 已回退至可用字幕轨 ${track.languageCode || 'unknown'} (${rows.length} 条)`);
+      return { rows, label };
+    } catch (error) {
+      pushLog('warn', `[youtube/cc] ${track.languageCode || 'unknown'} 读取失败：${error?.message || error}；尝试其它轨道`);
+    }
   }
-  url.searchParams.set('fmt', 'json3');
-  const response = await fetch(url.href, { credentials: 'include', cache: 'no-store' });
-  if (!response.ok) throw new Error(`YouTube 字幕 HTTP ${response.status}`);
-  const subtitle = await response.json();
-  const rows = (subtitle.events || []).map((event) => ({
-    from: Number(event.tStartMs) / 1000,
-    to: (Number(event.tStartMs) + Number(event.dDurationMs || 0)) / 1000,
-    content: (event.segs || []).map((segment) => segment.utf8 || '').join('').replace(/\s+/g, ' ').trim()
-  })).filter((row) => row.content);
-  if (!rows.length) return null;
-  // 与 B 站同理：字幕时间戳跨度超过视频总时长即说明不属于本视频。
-  const stateDuration = Number(playerState?.lengthSeconds) || 0;
-  if (!ccSubtitleFitsPart(rows, stateDuration)) {
-    pushLog('warn', `[youtube] 已拒绝时间跨度不符的字幕：字幕结束 ${ccSubtitleSpan(rows).to.toFixed(1)}s ` +
-      `超过视频总时长 ${stateDuration}s`);
-    return null;
-  }
-  // 同样要求覆盖整支视频：只有开头的字幕没有总结价值。
-  const coverage = assessSubtitleCoverage(rows, stateDuration);
-  if (!coverage.usable) {
-    pushLog('warn', `[youtube] 已拒绝覆盖不足的字幕：仅 ${coverage.cues} 条、覆盖到 ` +
-      `${(coverage.covered * 100).toFixed(1)}%、语音条目占比 ${(coverage.speechRatio * 100).toFixed(0)}%；改用本地识别`);
-    return null;
-  }
-  const automatic = selected.kind === 'asr' ? '自动字幕' : '字幕';
-  return { rows, label: `YouTube ${automatic}${selected.name ? `（${selected.name}）` : ''}` };
+  pushLog('warn', `[youtube/cc] 已检查 ${attempts} 条候选字幕轨，均不可用；改用本地识别`);
+  return null;
 }
 
 function browserBackendMode(settings) {
@@ -2760,7 +2819,9 @@ async function browserTranscribeRequestNow(request, onProgress, control = null) 
     if (!isDirectAudioFailure(error)) throw error;
     // A cached player URL can expire even without a queue wait. Refresh the
     // same media once before giving up the fast audio-track path.
-    if (request.directSource?.platform === 'bilibili' && !request.audioRefreshRetried) {
+    if ((request.directSource?.platform === 'bilibili' ||
+        (request.directSource?.platform === 'youtube' && /HTTP (?:403|410)|过期|expired|签名|signature/i.test(error?.message || ''))) &&
+        !request.audioRefreshRetried) {
       request.audioRefreshRetried = true;
       if (await refreshQueuedDirectSource(request, onProgress, control, true)) {
         throwIfBrowserRequestCancelled(control);
@@ -3138,20 +3199,6 @@ function resultDurationMatches(recorded, expected, toleranceRatio = 0.05, tolera
   return Math.abs(left - right) <= Math.max(right * toleranceRatio, toleranceSeconds);
 }
 
-function genericPageIdentity(value) {
-  const url = new URL(value || 'https://invalid.local/');
-  url.hash = '';
-  // Ignore navigation noise that does not identify the media itself. Unknown
-  // query parameters are intentionally preserved so ?id= / ?episode= changes
-  // still invalidate stale captions and per-video translation overrides.
-  const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
-  for (const key of [...url.searchParams.keys()]) {
-    if (transient.test(key)) url.searchParams.delete(key);
-  }
-  url.searchParams.sort();
-  return url.href;
-}
-
 function resultMatchesTabUrl(result, candidateUrl) {
   try {
     const currentUrl = new URL(candidateUrl || 'https://invalid.local/');
@@ -3166,7 +3213,7 @@ function resultMatchesTabUrl(result, candidateUrl) {
       const currentId = currentUrl.searchParams.get('v') || currentUrl.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
       return currentId === result.sourceVideoId;
     }
-    return genericPageIdentity(currentUrl.href) === genericPageIdentity(source.href);
+    return currentUrl.href === source.href;
   } catch {
     return false;
   }
@@ -3300,7 +3347,7 @@ function matchesLiveSource(session, candidateUrl) {
       const candidateId = candidate.searchParams.get('v') || candidate.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1] || '';
       return candidateId === session.sourceVideoId;
     }
-    return genericPageIdentity(candidate.href) === genericPageIdentity(source.href);
+    return candidate.href === source.href;
   } catch {
     return false;
   }
@@ -4661,13 +4708,14 @@ function addTimelineSegment(session, segment, opts = {}) {
     if (session.rows[middle].from < normalized.from) low = middle + 1;
     else high = middle;
   }
-  const duplicate = findSameCaptionOccurrence(session.rows, normalized);
+  const duplicateIndex = findSameCaptionOccurrenceIndex(session.rows, normalized);
+  const duplicate = duplicateIndex >= 0 ? session.rows[duplicateIndex] : null;
   if (duplicate) {
     // Keep the canonical start used by the page and translation cache.
     normalized.from = duplicate.from;
     normalized.to = duplicate.to;
   }
-  const nearIndex = duplicate ? session.rows.indexOf(duplicate)
+  const nearIndex = duplicate ? duplicateIndex
     : [low - 1, low].find((index) => index >= 0 && index < session.rows.length && Math.abs(session.rows[index].from - normalized.from) < 0.05);
   if (nearIndex !== undefined) session.rows[nearIndex] = normalized;
   else session.rows.splice(low, 0, normalized);
@@ -4680,18 +4728,69 @@ function addTimelineSegment(session, segment, opts = {}) {
   return normalized;
 }
 
-function findSameCaptionOccurrence(rows, candidate) {
+function findSameCaptionOccurrenceIndex(rows, candidate) {
   const key = row => String(row.originalContent || row.sourceContent || row.content || '')
     .toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
   const text = key(candidate);
-  if (!text) return null;
-  for (const row of rows) {
-    if (Math.abs(row.from - candidate.from) > 0.25 || Math.abs(row.to - candidate.to) > 0.35) continue;
+  if (!text) return -1;
+  // rows is sorted by start time. Duplicate detection used to scan the complete
+  // transcript for every emitted cue, turning a long session into O(n²). Only
+  // cues within ±250 ms can possibly satisfy the duplicate rule.
+  let low = 0;
+  let high = rows.length;
+  const minimumFrom = candidate.from - 0.25;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (Number(rows[middle].from) < minimumFrom) low = middle + 1;
+    else high = middle;
+  }
+  for (let index = low; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (row.from > candidate.from + 0.25) break;
+    if (Math.abs(row.to - candidate.to) > 0.35) continue;
     const overlap = Math.min(row.to, candidate.to) - Math.max(row.from, candidate.from);
     const duration = Math.min(row.to - row.from, candidate.to - candidate.from);
-    if (duration > 0 && overlap >= duration * 0.6 && key(row) === text) return row;
+    if (duration > 0 && overlap >= duration * 0.6 && key(row) === text) return index;
   }
-  return null;
+  return -1;
+}
+
+function addCoverageRange(session, fromValue, toValue) {
+  const from = Math.max(0, Number(fromValue) || 0);
+  const to = Math.max(from, Number(toValue) || from);
+  if (!(to > from)) return;
+  const ranges = session.captureCoverage ||= [];
+  // Common live path is monotonic append: merge in O(1). Seeks/out-of-order
+  // finals use a binary insertion and only merge the local neighborhood.
+  const last = ranges.at(-1);
+  if (!last || from >= last.from) {
+    if (last && from <= last.to + 0.05) last.to = Math.max(last.to, to);
+    else ranges.push({ from, to });
+  } else {
+    let low = 0;
+    let high = ranges.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (ranges[middle].from < from) low = middle + 1;
+      else high = middle;
+    }
+    ranges.splice(low, 0, { from, to });
+    let start = Math.max(0, low - 1);
+    let write = start;
+    let current = { ...ranges[start] };
+    for (let index = start + 1; index < ranges.length; index += 1) {
+      const range = ranges[index];
+      if (range.from <= current.to + 0.05) {
+        current.to = Math.max(current.to, range.to);
+        continue;
+      }
+      ranges[write++] = current;
+      current = range;
+    }
+    ranges[write++] = current;
+    ranges.length = write;
+  }
+  if (ranges.length > MAX_LIVE_ROWS) ranges.splice(0, ranges.length - MAX_LIVE_ROWS);
 }
 
 function captionTextLength(value) {
@@ -4877,7 +4976,8 @@ function videoTranslationIdentity(pageUrl) {
     const id = url.searchParams.get('v') || url.pathname.match(/^\/shorts\/([^/?#]+)/)?.[1];
     if (id) return `youtube:${id}`;
   }
-  return genericPageIdentity(url.href);
+  url.hash = '';
+  return url.href;
 }
 
 async function settingsForVideo(tabId, pageUrl, settings) {
@@ -4924,9 +5024,7 @@ function configureSessionTranslator(session, settings) {
     // 文案必须说清"不会自动恢复"：旧文案让人以为等一会儿译文就会自己接上。
     void queueLiveMessage(session, {
       type: 'BSCG_LIVE_PROGRESS',
-      text: config.displayMode === 'translated'
-        ? `翻译已停止：${String(error).slice(0, 90)}；仅译文模式不会显示未验证原文，拖动进度条或重新开始字幕即可恢复`
-        : `翻译已停止：${String(error).slice(0, 90)}；后续字幕只显示识别原文，拖动进度条或重新开始字幕即可恢复`
+      text: `翻译已停止：${String(error).slice(0, 90)}；后续字幕只显示识别原文，拖动进度条或重新开始字幕即可恢复`
     });
   });
   const originals = [...session.originalCaptionRows.values()];
@@ -5042,8 +5140,6 @@ async function startCachedCaptionSession(tab, settings, rows, cached = null) {
 
 // 实时捕获按完整识别句翻译。草稿只保留最新待处理版本，定稿优先且仅定稿入时间轴。
 function startRealtimeCaptionTranslator(session, config, onError) {
-  const requestController = new AbortController();
-  config = { ...config, abortSignal: requestController.signal };
   let stopped = false;
   let inflight = null;
   let preview = null;
@@ -5249,9 +5345,7 @@ function startRealtimeCaptionTranslator(session, config, onError) {
     },
     cancel: () => {
       const dropped = finals.length + Number(Boolean(preview));
-      stopped = true;
-      if (!requestController.signal.aborted) requestController.abort('translation-cancelled');
-      preview = null; finals.length = 0; resolveCancelled();
+      stopped = true; preview = null; finals.length = 0; resolveCancelled();
       // 拖动、改设置、会话结束都会走到这里，丢掉的是"还没翻完的句子"：
       // 排查"拖动后字幕短暂空白"时先看这条，再看其后是否重新入队。
       if (dropped) pushLog('info', `[translate/realtime] 已丢弃 ${dropped} 个在途/排队单句（设置变更、拖动或会话结束）`);
@@ -5274,13 +5368,11 @@ function isContentTranslateFailure(error) {
 }
 
 function startBrowserDirectTranslator(session, settings, onError) {
-  let config = translateActiveConfig(settings);
+  const config = translateActiveConfig(settings);
   if (!translateIsReady(config)) return null;
   if (session.mode === 'browser-capture') return startRealtimeCaptionTranslator(session, {
     ...config, finalOnly: false, sourceLanguage: session.settings?.asrProfile === 'qwen3_asr_0_6b' ? 'auto' : (session.settings?.asrLanguage || 'auto')
   }, onError);
-  const requestController = new AbortController();
-  config = { ...config, abortSignal: requestController.signal };
   // API 优先凑够 200 字，上限 24 行 / 900 字；ONNX 使用小批次降低首句等待。
   // Local autoregressive GPU translation favors short jobs; API batching keeps
   // its existing throughput policy. Near the playhead, publish one GPU row first.
@@ -5650,7 +5742,6 @@ function startBrowserDirectTranslator(session, settings, onError) {
     finish,
     cancel: () => {
       stopped = true;
-      if (!requestController.signal.aborted) requestController.abort('translation-cancelled');
       resolveCancelled();
       pending.length = 0;
       heldRows.length = 0;
@@ -6006,15 +6097,7 @@ async function startBrowserCapturedLiveCapture(tab, settings, borrowTask = null,
       pushLog('info', `[asr/final] 断句=${phraseReason || 'manual'} ` +
         `音频=${(Number(phraseAudioSeconds) || 0).toFixed(1)}s id=${finalSegment.id} ` +
         `timing=${JSON.stringify(phraseTiming || {})} · ${String(finalSegment.content).replace(/\s+/g, ' ').slice(0, 40)}`);
-      session.captureCoverage ||= [];
-      session.captureCoverage.push({ from: finalSegment.from, to: finalSegment.to });
-      session.captureCoverage.sort((a, b) => a.from - b.from);
-      session.captureCoverage = session.captureCoverage.reduce((ranges, range) => {
-          const last = ranges.at(-1);
-          if (last && range.from <= last.to + 0.05) last.to = Math.max(last.to, range.to);
-          else ranges.push({ ...range });
-          return ranges;
-      }, []).slice(-MAX_LIVE_ROWS);
+      addCoverageRange(session, finalSegment.from, finalSegment.to);
       if (translateActiveConfig(session.settings).enabled) {
         session.bufferedTo = Math.max(Number(session.bufferedTo) || 0, Number(finalSegment.to) || 0);
         // Only acoustic sentence boundaries may split a final. Never distribute
@@ -6170,8 +6253,23 @@ async function handleLiveSeek(tabId, currentTime) {
     session.finalSegment = null;
     await queueLiveMessage(session, { type: 'BSCG_LIVE_PREVIEW_CLEAR', sessionId: session.sessionId });
     let cachedThrough = session.currentVideoTime;
-    for (const row of session.captureCoverage?.length ? session.captureCoverage : session.rows) {
-      if (row.from <= cachedThrough + 0.01 && row.to > cachedThrough) cachedThrough = row.to;
+    const coverage = session.captureCoverage;
+    if (coverage?.length) {
+      // Merged intervals are ordered and disjoint. Locate a seek point in O(log n)
+      // instead of inspecting every previously captured interval.
+      let low = 0, high = coverage.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (coverage[mid].from <= cachedThrough + 0.01) low = mid + 1;
+        else high = mid;
+      }
+      const span = coverage[low - 1];
+      if (span && span.to > cachedThrough) cachedThrough = span.to;
+    } else {
+      // Initial borrowed rows may predate the capture coverage index.
+      for (const row of session.rows) {
+        if (row.from <= cachedThrough + 0.01 && row.to > cachedThrough) cachedThrough = row.to;
+      }
     }
     await sendToOffscreen({
       type: 'BILI_ASR_CLOCK', tabId: session.tabId,
@@ -6230,14 +6328,52 @@ async function requestLiveStop(tabId, message = {}) {
   return { ok: true, stopping: false };
 }
 
+const CAPTION_SITE_MEMORY_KEY = 'captionRememberedSites';
+let captionSiteChoiceChain = Promise.resolve();
+
+function captionSiteKey(rawUrl) {
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (!/^https?:$/.test(url.protocol)) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
+function rememberCaptionSiteChoice(rawUrl, enabled) {
+  const site = captionSiteKey(rawUrl);
+  if (!site) return Promise.resolve({ ok: true, ignored: true });
+  const mutate = async () => {
+    const stored = await chrome.storage.local.get(['rememberCaptionSites', CAPTION_SITE_MEMORY_KEY]);
+    // Site learning is opt-in. If the global switch is off, manual caption clicks
+    // behave exactly as before and do not silently rewrite the dormant list.
+    if (!stored.rememberCaptionSites) return { ok: true, ignored: true };
+    const sites = { ...(stored[CAPTION_SITE_MEMORY_KEY] || {}) };
+    if (enabled) sites[site] = Date.now();
+    else delete sites[site];
+    await chrome.storage.local.set({ [CAPTION_SITE_MEMORY_KEY]: sites });
+    return { ok: true, site, remembered: Boolean(enabled) };
+  };
+  const result = captionSiteChoiceChain.then(mutate, mutate);
+  captionSiteChoiceChain = result.catch(() => {});
+  return result;
+}
+
 async function shouldAutoStartCaptions(tab) {
   if (!tab?.id || !/^(https?|file):/i.test(tab.url || '')) return false;
   if (!bscgPageAllowsControls(tab.url)) return false;
   if (!tab.active) return false;
   if (Number.isInteger(tab.windowId) && !(await chrome.windows.get(tab.windowId)).focused) return false;
   if (liveCaptures.has(tab.id)) return false;
-  const settings = { ...DEFAULTS, ...(await chrome.storage.local.get(Object.keys(DEFAULTS))) };
+  const stored = await chrome.storage.local.get([...Object.keys(DEFAULTS), CAPTION_SITE_MEMORY_KEY]);
+  const settings = { ...DEFAULTS, ...stored };
   const url = new URL(tab.url);
+  const rememberedSites = stored[CAPTION_SITE_MEMORY_KEY] || {};
+  // An explicit per-site choice is stronger than generic platform policy. If the
+  // user deliberately enabled our captions here, honor that even when the site
+  // also exposes official/CC subtitles.
+  if (settings.rememberCaptionSites && rememberedSites[captionSiteKey(tab.url)]) return true;
   if (url.hostname === 'live.bilibili.com') return Boolean(liveCapturePolicy(tab.url).roomId && settings.autoCaptionsMainstream);
   if (url.hostname === 'www.bilibili.com' || /(^|\.)youtube\.com$/i.test(url.hostname)) {
     if (!settings.autoCaptionsMainstream) return false;
@@ -6312,13 +6448,28 @@ async function startLiveCaptureNow(tabId, ignoreCache = false, message = {}) {
   await setCaptionDisplay(tabId, true, message);
   if (liveCaptures.has(tabId)) {
     const existingSession = liveCaptures.get(tabId);
-    if (!existingSession.stopRequested) return { ok: true, alreadyRunning: true, mode: existingSession.mode };
+    if (!existingSession.stopRequested) {
+      // A content script may have been reinjected while the background session
+      // kept running. Return the complete normalized UI state (sessionId,
+      // timeline mode, existing rows and queue state), not the internal
+      // `browser-direct`/`browser-capture` mode. This makes a button click
+      // idempotent instead of attaching a half-initialized UI to an old task.
+      return { ...(await getLiveUiState(tabId, message.pageUrl || '')), alreadyRunning: true };
+    }
     // 用户刚点停止又立刻重新启动（最近选择为准）：等上一轮收尾完成后重开新会话。
     const deadline = Date.now() + 13000;
     while (liveCaptures.has(tabId) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    if (liveCaptures.has(tabId)) return { ok: true, alreadyRunning: true, mode: liveCaptures.get(tabId).mode };
+    if (liveCaptures.has(tabId)) {
+      const stuck = liveCaptures.get(tabId);
+      // Stop has a 12s watchdog. If the user explicitly asked to reopen and the
+      // old session still owns the tab after that window, retire it rather than
+      // reporting a stopping session as if it were running.
+      stuck.browserControl?.abort?.('旧字幕会话停止超时，正在重新开启');
+      await finalizeLiveCapture(stuck, { segments: stuck.rows, reason: 'restart-after-stop-timeout' }).catch(() => {});
+    }
+    if (liveCaptures.has(tabId)) throw new Error('上一轮字幕仍在收尾，请再次点击字幕');
   }
   const tab = await chrome.tabs.get(tabId);
   if (message.automatic && !tab.active) return { ok: true, superseded: true };

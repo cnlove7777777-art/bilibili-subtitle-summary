@@ -20,6 +20,7 @@ const DEFAULTS = {
   voiceEnhancePreset: 'balanced',
   autoCaptionsMainstream: false,
   autoCaptionsOther: false,
+  rememberCaptionSites: false,
   // 前瞻字幕翻译：只对能直接取到音轨的整轨识别（B站音轨 / M3U8 / MP4）生效
   translateEnabled: false,
   translateMode: 'local',
@@ -46,7 +47,7 @@ const fieldIds = [
   'translateRemoteBaseUrl', 'translateRemoteApiKey', 'translateRemoteModel',
   'translateOnnxModel'
 ];
-const toggleIds = ['voiceEnhance', 'autoCaptionsMainstream', 'autoCaptionsOther', 'translateEnabled', 'logPersist'];
+const toggleIds = ['voiceEnhance', 'autoCaptionsMainstream', 'autoCaptionsOther', 'rememberCaptionSites', 'translateEnabled', 'logPersist'];
 const NUMBER_FIELDS = {
   liveChunkSeconds: { min: 4, max: 12, fallback: 11.5 },
   recognitionThreads: { min: 0, max: 16, fallback: 0 },

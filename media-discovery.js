@@ -86,16 +86,7 @@ function bscgFindMedia(mode = 'clock') {
     const direct = [video.currentSrc, video.src].find(value => /^(https?|file):/i.test(String(value || ''))) || '';
     const classify = (url, kind = '') => kind || (/\.m3u8(?:$|[?#])/i.test(url) ? 'hls' : /\.mpd(?:$|[?#])/i.test(url) ? 'dash' : 'media');
     const observed = Array.isArray(window.__BROWSER_SENSEVOICE_MEDIA_URLS__) ? window.__BROWSER_SENSEVOICE_MEDIA_URLS__ : [];
-    const pageIdentity = value => {
-      try {
-        const url = new URL(value);
-        url.hash = '';
-        const transient = /^(?:utm_.+|spm|spm_id_from|share_.+|feature|si|pp|ref|referrer|source|from|autoplay|start|t|time_continue)$/i;
-        for (const key of [...url.searchParams.keys()]) if (transient.test(key)) url.searchParams.delete(key);
-        url.searchParams.sort();
-        return url.href;
-      } catch { return ''; }
-    };
+    const pageIdentity = value => { try { const url = new URL(value); url.hash = ''; return url.href; } catch { return ''; } };
     const records = [...observed.filter(entry => ['hls', 'dash', 'media'].includes(entry.kind) &&
       (!entry.pageUrl || pageIdentity(entry.pageUrl) === pageIdentity(location.href))).reverse()];
     // Prefer the known parent of the most recent HLS child. The parent exposes
@@ -118,12 +109,9 @@ function bscgFindMedia(mode = 'clock') {
     // A usable currentSrc is authoritative. Network manifests are a fallback
     // for a blob-backed player, rather than overriding a real direct source.
     if (!direct) for (const entry of records) add(entry);
-    const first = candidates[0] || null;
-    // Even if the page exposes only blob:/MediaSource and no readable URL, keep
-    // the active media/frame identity. The service worker may still have seen
-    // extensionless HLS/DASH/audio requests through webRequest.
-    return { mediaUrl: first?.url || '', kind: first?.kind || '',
-      manifest: first?.kind === 'hls',
+    const first = candidates[0];
+    if (!first) return null;
+    return { mediaUrl: first.url, kind: first.kind, manifest: first.kind === 'hls',
       dashManifest: candidates.find(item => item.kind === 'dash')?.url || '', candidates,
       referer: location.href, title: document.title || '',
       currentTime: Math.max(0, Number(video.currentTime) || 0),

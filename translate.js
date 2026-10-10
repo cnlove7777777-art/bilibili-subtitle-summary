@@ -88,18 +88,26 @@
     return `${config.baseUrl}/chat/completions`;
   }
 
+  // CWS 隐私安全：外部翻译服务必须 HTTPS；HTTP 仅用于本机回环服务。
+  // 避免将字幕、Authorization 凭据经明文公网或局域网连接发送。
+  function translateBaseUrlAllowed(config) {
+    if (!config || config.mode === 'onnx') return true;
+    try {
+      const url = new URL(String(config.baseUrl || ''));
+      if (url.username || url.password || url.search || url.hash) return false;
+      if (url.protocol === 'https:') return true;
+      return config.mode === 'local' && url.protocol === 'http:' &&
+        ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname.toLowerCase());
+    } catch { return false; }
+  }
+
   function translateIsReady(config) {
-    return Boolean(
-      config &&
-      config.enabled &&
-      config.model &&
-      (config.mode === 'onnx' || /^https?:\/\//i.test(String(config.baseUrl || '')))
-    );
+    return Boolean(config && config.enabled && config.model && translateBaseUrlAllowed(config));
   }
 
   function translateUnavailableReason(config) {
     if (!config || !config.enabled) return '翻译未启用';
-    if (config.mode !== 'onnx' && !/^https?:\/\//i.test(String(config.baseUrl || ''))) return 'Base URL 无效（需 http/https）';
+    if (!translateBaseUrlAllowed(config)) return '远程接口必须使用 HTTPS；本地 HTTP 仅支持 localhost / 127.0.0.1 / [::1]';
     if (!config.model) return '未选择模型';
     return '';
   }
@@ -110,29 +118,11 @@
     return headers;
   }
 
-  const abortSignalCleanups = new WeakMap();
-
-  function abortSignalFor(timeoutMs, parentSignal = null) {
+  function abortSignalFor(timeoutMs) {
     const controller = new AbortController();
-    let parentAbort = null;
     const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 0));
-    const cleanup = () => {
-      clearTimeout(timer);
-      if (parentSignal && parentAbort) parentSignal.removeEventListener('abort', parentAbort);
-      abortSignalCleanups.delete(controller.signal);
-    };
-    if (parentSignal) {
-      parentAbort = () => controller.abort(parentSignal.reason);
-      if (parentSignal.aborted) controller.abort(parentSignal.reason);
-      else parentSignal.addEventListener('abort', parentAbort, { once: true });
-    }
-    controller.signal.addEventListener('abort', cleanup, { once: true });
-    abortSignalCleanups.set(controller.signal, cleanup);
+    controller.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
     return controller.signal;
-  }
-
-  function cleanupAbortSignal(signal) {
-    abortSignalCleanups.get(signal)?.();
   }
 
   async function readResponseError(response) {
@@ -155,29 +145,23 @@
 
   // 模型清单：同时兼容 OpenAI（data[].id）与 llama.cpp 新版（models[].name + data[].id）。
   async function listTranslateModels(config) {
-    if (!/^https?:\/\//i.test(String(config?.baseUrl || ''))) throw new Error('Base URL 无效（需 http/https）');
+    if (!translateBaseUrlAllowed(config)) throw new Error('远程接口必须使用 HTTPS；本地 HTTP 仅支持回环地址');
     const signal = abortSignalFor(TRANSLATE_MODEL_LIST_TIMEOUT_MS);
     let response;
     try {
-      response = await fetch(translateModelsUrl(config), { method: 'GET', headers: translateAuthHeaders(config), signal });
+      response = await fetch(translateModelsUrl(config), { method: 'GET', headers: translateAuthHeaders(config), signal, redirect: 'error', credentials: 'omit', referrerPolicy: 'no-referrer' });
     } catch (error) {
-      cleanupAbortSignal(signal);
       throw new Error(`无法连接翻译服务：${error?.message || String(error)}`);
     }
-    let payload;
-    try {
-      if (!response.ok) {
-        const detail = await readResponseError(response);
-        throw new Error(
-          /^HTTP 40[13]/.test(detail) ? `${detail}（请确认 API Key 与 Base URL）` : `获取模型列表失败：${detail}`
-        );
-      }
-      payload = await response.json().catch((error) => {
-        throw new Error(`模型列表不是合法 JSON：${error?.message || String(error)}`);
-      });
-    } finally {
-      cleanupAbortSignal(signal);
+    if (!response.ok) {
+      const detail = await readResponseError(response);
+      throw new Error(
+        /^HTTP 40[13]/.test(detail) ? `${detail}（请确认 API Key 与 Base URL）` : `获取模型列表失败：${detail}`
+      );
     }
+    const payload = await response.json().catch((error) => {
+      throw new Error(`模型列表不是合法 JSON：${error?.message || String(error)}`);
+    });
     const entries = [];
     const seen = new Set();
     const push = (id, extra = {}) => {
@@ -330,21 +314,23 @@
   }
 
   // texts -> { ok, texts } 或 { ok:false, error }；调用方失败时应回退展示原文。
-  async function translateLines(config, texts, parentSignal = null) {
+  async function translateLines(config, texts) {
     const lines = (Array.isArray(texts) ? texts : []).map(normalizeSubtitleText);
     if (!lines.length) return { ok: true, texts: [] };
+    if (!translateBaseUrlAllowed(config)) return { ok: false, error: '远程接口必须使用 HTTPS；本地 HTTP 仅支持回环地址' };
     const release = await acquireTranslateSlot();
     const modelKey = JSON.stringify([config.mode, config.baseUrl, config.model]);
     // Keep the existing cold-start allowance for local GGUF loading. Once this
     // instance has replied, realtime requests receive a short service deadline.
     const timeoutMs = config.realtime && (config.mode === 'remote' || warmTranslateModels.has(modelKey))
       ? 5000 : TRANSLATE_REQUEST_TIMEOUT_MS;
-    const signal = abortSignalFor(timeoutMs, parentSignal);
     try {
+      const signal = abortSignalFor(timeoutMs);
       const response = await fetch(translateCompletionsUrl(config), {
         method: 'POST',
         headers: translateAuthHeaders(config),
         signal,
+        redirect: 'error', credentials: 'omit', referrerPolicy: 'no-referrer',
         body: JSON.stringify({
           model: config.model,
           messages: [
@@ -371,12 +357,9 @@
       if (warmTranslateModels.size > 16) warmTranslateModels.delete(warmTranslateModels.values().next().value);
       return { ok: true, texts: parsed.map((line) => line || '') };
     } catch (error) {
-      const aborted = error?.name === 'AbortError' || error?.name === 'TimeoutError' || signal.aborted;
-      const cancelled = Boolean(parentSignal?.aborted);
-      return { ok: false, error: cancelled ? '翻译请求已取消' :
-        aborted ? `翻译请求超时（${Math.round(timeoutMs / 1000)} 秒）` : (error?.message || String(error)) };
+      const aborted = error?.name === 'AbortError' || error?.name === 'TimeoutError';
+      return { ok: false, error: aborted ? `翻译请求超时（${Math.round(timeoutMs / 1000)} 秒）` : (error?.message || String(error)) };
     } finally {
-      cleanupAbortSignal(signal);
       release();
     }
   }

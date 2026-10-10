@@ -33,6 +33,19 @@
     return url.href;
   }
 
+  // Byte ranges address one finite part of a larger resource. Missing offsets
+  // may only continue the immediately previous range on the *same* URI.
+  function parseByteRange(value, prior = null, url = '') {
+    const match = String(value || '').trim().match(/^(\d+)(?:@(\d+))?$/);
+    if (!match) throw new Error('HLS BYTERANGE 长度/偏移格式无效');
+    const length = Number(match[1]);
+    const offset = match[2] === undefined
+      ? (prior?.url === url ? prior.offset + prior.length : NaN) : Number(match[2]);
+    if (!Number.isSafeInteger(length) || length < 1 || !Number.isSafeInteger(offset) || offset < 0 ||
+      !Number.isSafeInteger(offset + length - 1)) throw new Error('HLS BYTERANGE 缺少同 URI 连续偏移或超出安全整数范围');
+    return { offset, length, url };
+  }
+
   function parsePlaylist(text, playlistUrl) {
     const lines = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     if (lines[0] !== '#EXTM3U') throw new Error('不是有效的 HLS m3u8 清单');
@@ -46,9 +59,13 @@
     let key = null;
     let initMap = null;
     let unsupportedByteRange = false;
+    let pendingByteRange = null;
+    let previousByteRange = null;
     let endList = false;
     let discontinuity = 0;
     let timeline = 0;
+    let contextGroup = 0;
+    let lastContext = null;
 
     for (const line of lines.slice(1)) {
       if (line.startsWith('#EXT-X-STREAM-INF:')) {
@@ -81,13 +98,14 @@
         }
       } else if (line.startsWith('#EXT-X-MAP:')) {
         const attributes = parseAttributes(line.slice(line.indexOf(':') + 1));
-        if (attributes.BYTERANGE) unsupportedByteRange = true;
-        if (attributes.URI) initMap = {
-          url: absoluteUrl(attributes.URI, playlistUrl),
-          key: key ? { ...key } : null
-        };
+        if (attributes.URI) {
+          const mapUrl = absoluteUrl(attributes.URI, playlistUrl);
+          // EXT-X-MAP BYTERANGE does not inherit the media segment offset.
+          const mapRange = attributes.BYTERANGE ? parseByteRange(attributes.BYTERANGE, null, mapUrl) : null;
+          initMap = { url: mapUrl, range: mapRange, key: key ? { ...key } : null };
+        }
       } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
-        unsupportedByteRange = true;
+        pendingByteRange = line.slice(line.indexOf(':') + 1).trim();
       } else if (line === '#EXT-X-DISCONTINUITY') {
         discontinuity += 1;
       } else if (line === '#EXT-X-ENDLIST') {
@@ -103,14 +121,25 @@
           });
           streamInfo = null;
         } else {
-          segments.push({ url, duration, sequence: nextSequence++, key: key ? { ...key } : null,
-            initMap: initMap ? { ...initMap } : null, discontinuity, start: timeline, end: timeline + duration });
+          // Precompute the init-map/discontinuity group once per playlist.
+          // HLS window planning must not stringify this context for each seek.
+          const context = JSON.stringify([discontinuity, initMap?.url || '',
+            initMap?.range?.offset ?? null, initMap?.range?.length ?? null,
+            initMap?.key?.url || '', initMap?.key?.iv || '']);
+          if (context !== lastContext) { contextGroup += 1; lastContext = context; }
+          const range = pendingByteRange ? parseByteRange(pendingByteRange, previousByteRange, url) : null;
+          previousByteRange = range;
+          pendingByteRange = null;
+          segments.push({ url, range, duration, sequence: nextSequence++, key: key ? { ...key } : null,
+            initMap: initMap ? { ...initMap } : null, discontinuity, contextGroup,
+            start: timeline, end: timeline + duration });
           timeline += duration;
           duration = 0;
         }
       }
     }
 
+    if (pendingByteRange) throw new Error('HLS BYTERANGE 标记没有对应媒体 URI');
     return {
       playlistUrl,
       master: variants.length > 0 || audioRenditions.length > 0,
@@ -126,14 +155,27 @@
 
   function planWindow(segments, time, seconds = 30) {
     const target = Math.max(0, Number(time) || 0);
-    let at = segments.findIndex(segment => segment.end > target + 0.025);
-    if (at < 0) return null;
-    const context = segment => JSON.stringify([segment.discontinuity || 0, segment.initMap?.url || '',
-      segment.initMap?.key?.url || '', segment.initMap?.key?.iv || '']);
-    if (at > 0 && context(segments[at - 1]) === context(segments[at])) at -= 1;
+    // Segment end times are monotonic. Rolling lookahead calls this repeatedly,
+    // so a linear findIndex makes a 10k-segment HLS VOD pay O(n) for every
+    // window. Binary search keeps seeks/prefetch planning O(log n).
+    let low = 0;
+    let high = segments.length;
+    const threshold = target + 0.025;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (Number(segments[middle].end) <= threshold) low = middle + 1;
+      else high = middle;
+    }
+    let at = low;
+    if (at >= segments.length) return null;
+    const sameContext = (a, b) => Number.isInteger(a.contextGroup) && Number.isInteger(b.contextGroup)
+      ? a.contextGroup === b.contextGroup
+      : JSON.stringify([a.discontinuity || 0, a.initMap?.url || '', a.initMap?.range?.offset ?? null, a.initMap?.range?.length ?? null, a.initMap?.key?.url || '', a.initMap?.key?.iv || '']) ===
+        JSON.stringify([b.discontinuity || 0, b.initMap?.url || '', b.initMap?.range?.offset ?? null, b.initMap?.range?.length ?? null, b.initMap?.key?.url || '', b.initMap?.key?.iv || '']);
+    if (at > 0 && sameContext(segments[at - 1], segments[at])) at -= 1;
     let end = at + 1;
     const until = target + Math.max(1, Number(seconds) || 30);
-    while (end < segments.length && segments[end - 1].end < until && context(segments[end]) === context(segments[at])) end += 1;
+    while (end < segments.length && segments[end - 1].end < until && sameContext(segments[end], segments[at])) end += 1;
     return { from: at, to: end, start: segments[at].start, end: segments[end - 1].end,
       requestedTime: target, complete: end === segments.length };
   }

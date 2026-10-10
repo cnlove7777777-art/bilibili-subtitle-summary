@@ -1,9 +1,10 @@
 name: Verify extension
-
 on:
   push:
+    branches: [main]
   pull_request:
-
+permissions:
+  contents: write
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -11,20 +12,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - name: Run review regressions
+          node-version: '22'
+      - name: Review 0.16.51 sources
         run: node tests/review-regressions.mjs
-      - name: Package verified source
-        if: github.event_name == 'push'
+      - name: Assemble and validate Chrome-installable release ZIP
+        run: node scripts/assemble-0.16.51.mjs
+      - name: Inspect packaged extension manifest and browser runtime
         run: |
-          archive="browser-live-captions-source-${GITHUB_SHA::7}.zip"
-          zip -qr "$archive" . -x ".git/*" "$archive"
-          echo "BSCG_ARCHIVE=$archive" >> "$GITHUB_ENV"
-      - name: Upload verified source
+          python3 - <<'PY'
+          import zipfile,json,hashlib
+          path='dist/bili-subtitle-summary-0.16.51-cws-review.zip'
+          with zipfile.ZipFile(path) as z:
+              assert z.testzip() is None
+              data=json.loads(z.read('manifest.json'))
+              assert data['version']=='0.16.51'
+              for file in ('vendor/ort-wasm-simd-threaded.asyncify.wasm','vendor/ort-wasm-simd-threaded.jsep.wasm','vendor/transformers.min.js','privacy.html'):
+                  assert len(z.read(file))>100
+              print('INSTALLABLE ZIP VERIFIED: ',path)
+          PY
+      - name: Upload verified installable extension
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
-          name: browser-live-captions-source-${{ github.sha }}
-          path: ${{ env.BSCG_ARCHIVE }}
+          name: bilibili-subtitle-summary-v0.16.51-installable
+          path: dist/bili-subtitle-summary-0.16.51-cws-review.zip
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
+      - name: Publish/update GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='v0.16.51'
+          zip='dist/bili-subtitle-summary-0.16.51-cws-review.zip'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$zip" --clobber
+          else
+            gh release create "$tag" "$zip" --target "$GITHUB_SHA" --title 'v0.16.51 - Chrome Web Store review candidate' --notes-file RELEASE_NOTES-0.16.51.md
+          fi

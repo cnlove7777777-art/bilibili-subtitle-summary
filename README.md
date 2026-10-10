@@ -1,3 +1,7 @@
+> **最新版本：v0.16.51（Chrome Web Store 审核候选版）** · [下载完整可安装扩展 ZIP](https://github.com/cnlove7777777-art/bilibili-subtitle-summary/releases/tag/v0.16.51) · [自动化验证](https://github.com/cnlove7777777-art/bilibili-subtitle-summary/actions/workflows/verify.yml)
+>
+> 本次更新包含 YouTube CC、高速识别、HLS/DASH 长视频随机访问、站点字幕记忆与隐私说明。完整 WASM 运行库包含于 Release ZIP，仓库的 `release-parts/v0.16.51/` 用于由 CI 无损重组并验证该 ZIP；请勿将源码目录直接当作可安装扩展。
+
 <div align="center">
   <img src="icons/icon128.png" width="96" alt="Browser Live Captions icon">
   <h1>全网视频实时字幕与总结</h1>

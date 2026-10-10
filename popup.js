@@ -18,13 +18,6 @@ function show(title, text, kind = '') {
 async function activeTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id || !/^(https?|file):/i.test(tab.url || '')) throw new Error('请在播放视频或音频的网页中使用');
-  if (/^file:/i.test(tab.url || '')) {
-    const allowed = await new Promise((resolve) => chrome.extension.isAllowedFileSchemeAccess(resolve));
-    if (!allowed) {
-      await chrome.tabs.create({ url: `chrome://extensions/?id=${chrome.runtime.id}` });
-      throw new Error('请先在扩展详情页开启“允许访问文件网址”，然后重新打开本地媒体。');
-    }
-  }
   return tab;
 }
 function setState(isRunning, isShown = isRunning) {

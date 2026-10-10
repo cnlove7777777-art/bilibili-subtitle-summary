@@ -31,6 +31,7 @@
       <div class="side-foot">
         <span class="local-badge">本地推理</span>
         <p class="side-note">修改后自动保存。模型、后端和线程设置会在空闲时立即生效。</p>
+        <p class="side-note"><a href="privacy.html" target="_blank" rel="noopener noreferrer">隐私政策与数据处理说明</a></p>
       </div>
     </aside>
 
@@ -38,7 +39,7 @@
       <section class="card model-card" id="sec-model">
         <div class="section-title">
           <span>01</span>
-          <div><h2>识别</h2><p>选择本地模型和执行后端。</p></div>
+          <div><h2>识别</h2><p>选择本地模型和执行后端。扩展会在获授权的网站定位媒体资源，并在浏览器内处理字幕/音频；仅在启用远程翻译或点击总结时按相应设置传递字幕。</p></div>
         </div>
 
         <div class="route-grid">
@@ -89,7 +90,7 @@
               <select id="scanPlaybackRate">
                 <option value="1">1×</option><option value="2">2×</option><option value="3">3×</option><option value="4">4×</option><option value="6">6×（实验）</option><option value="8">8×（实验）</option>
               </select>
-              <span class="hint">无独立音轨时扫描，先恢复正常语速再识别。建议 2–4×；6–8× 受浏览器采集带宽限制，清晰度可能下降。积压时自动暂停/恢复。</span>
+              <span class="hint">无独立音轨时扫描，先恢复正常语速再识别。建议 2–4×；6–8× 为实验模式，部分播放器会直接静音或损失高频；不能通过降速恢复已丢失的信息。发现持续静音时会终止并提示降速。积压时自动暂停/恢复。</span>
             </label>
           </div>
         </div>
@@ -118,7 +119,7 @@
       </section>
 
       <section class="card" id="sec-summary" hidden>
-        <div class="section-title"><span>03</span><div><h2>总结</h2><p>点击总结后，字幕 TXT 会上传到你选择的 AI 网页并填入提示词；最终发送 / Run 由你确认。</p></div></div>
+        <div class="section-title"><span>03</span><div><h2>总结</h2><p>你点击总结后，字幕 TXT 会自动添加到你选择的 AI 网页并填入提示词；最终发送 / Run 由你确认。该服务可能接收到字幕文本和视频标题。</p></div></div>
         <div class="summary-toolbar">
           <label>默认目标<select id="defaultDestination"><option value="chatgpt">ChatGPT</option><option value="aistudio">Gemini</option><option value="deepseek">DeepSeek</option></select></label>
         </div>
@@ -131,12 +132,13 @@
       </section>
 
       <section class="card" id="sec-autocaption" hidden>
-        <div class="section-title"><span>04</span><div><h2>自动字幕</h2><p>页面没有现成字幕时自动启动本地识别。</p></div></div>
+        <div class="section-title"><span>04</span><div><h2>自动字幕</h2><p>可按网站类型自动启动，也可以记住你在各网站的手动字幕选择。</p></div></div>
         <div class="toggle-list">
           <label class="toggle-row"><input id="autoCaptionsMainstream" type="checkbox"><span><strong>B站与 YouTube</strong><small>仅在没有官方或 CC 字幕时启动。</small></span></label>
           <label class="toggle-row"><input id="autoCaptionsOther" type="checkbox"><span><strong>其他网站与本地视频</strong><small>检测到视频或播放中的音频后启动；可随时关闭。</small></span></label>
+          <label class="toggle-row"><input id="rememberCaptionSites" type="checkbox"><span><strong>记住各网站的字幕开关</strong><small>开启后，在某个网站手动打开字幕会记住该站；下次进入该站默认自动开启。手动关闭会取消该站的记忆。</small></span></label>
         </div>
-        <p class="section-footnote">刷新视频页面后生效。</p>
+        <p class="section-footnote">按站点（协议 + 域名 + 端口）记忆；关闭“记住”功能只暂停自动应用，不会删除已记住的站点。刷新视频页面后生效。</p>
       </section>
 
       <section class="card" id="sec-translate" hidden>
@@ -190,7 +192,7 @@
           <div class="translate-grid">
             <label>Base URL
               <input id="translateLocalBaseUrl" type="url" spellcheck="false" placeholder="http://127.0.0.1:8888/v1">
-              <span class="hint">默认指向本机 UNSLOTH Studio 的 API 端口。</span>
+              <span class="hint">本机 HTTP 仅支持 localhost/127.0.0.1/::1；其他设备的服务请使用 HTTPS。</span>
             </label>
             <label>API Key
               <input id="translateLocalApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="本地服务不需要鉴权时可留空">
@@ -211,7 +213,7 @@
           <div class="translate-grid">
             <label>Base URL
               <input id="translateRemoteBaseUrl" type="url" spellcheck="false" placeholder="https://api.openai.com/v1">
-              <span class="hint">填到 /v1 为止，程序会自己拼 /models 与 /chat/completions。</span>
+              <span class="hint">仅支持 HTTPS 远程接口。启用时，待翻译的字幕文本会发送到你填写的提供商；程序会自己拼 /models 与 /chat/completions。</span>
             </label>
             <label>API Key
               <input id="translateRemoteApiKey" type="password" spellcheck="false" autocomplete="off" placeholder="sk-…">
